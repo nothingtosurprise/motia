@@ -39,28 +39,16 @@ function locationOf(result) {
   return result.headers.location.value
 }
 
-test('/docs exact → 301 https://docs.iii.dev/docs', () => {
+test('/docs → function does not redirect', () => {
   const result = handler(buildEvent('/docs', 'iii.dev'))
-  assert.ok(isRedirect(result))
-  assert.equal(locationOf(result), 'https://docs.iii.dev/docs')
+  assert.ok(!isRedirect(result))
+  assert.equal(result.uri, '/index.html')
 })
 
-test('/docs/ trailing slash → 301 https://docs.iii.dev/docs/', () => {
-  const result = handler(buildEvent('/docs/', 'iii.dev'))
-  assert.ok(isRedirect(result))
-  assert.equal(locationOf(result), 'https://docs.iii.dev/docs/')
-})
-
-test('/docs/quickstart → 301 https://docs.iii.dev/docs/quickstart', () => {
+test('/docs/quickstart → function does not redirect', () => {
   const result = handler(buildEvent('/docs/quickstart', 'iii.dev'))
-  assert.ok(isRedirect(result))
-  assert.equal(locationOf(result), 'https://docs.iii.dev/docs/quickstart')
-})
-
-test('/docs/guide/deep/nested → preserves deep path on redirect', () => {
-  const result = handler(buildEvent('/docs/guide/deep/nested', 'iii.dev'))
-  assert.ok(isRedirect(result))
-  assert.equal(locationOf(result), 'https://docs.iii.dev/docs/guide/deep/nested')
+  assert.ok(!isRedirect(result))
+  assert.equal(result.uri, '/index.html')
 })
 
 test('/docsfoo → NOT redirected (not under /docs/)', () => {
@@ -87,14 +75,10 @@ test('www.iii.dev/some/page → 301 https://iii.dev/some/page', () => {
   assert.equal(locationOf(result), 'https://iii.dev/some/page')
 })
 
-test('www.iii.dev/docs/foo → 301 https://docs.iii.dev/docs/foo (ONE hop, not two)', () => {
+test('www.iii.dev/docs/foo → 301 https://iii.dev/docs/foo', () => {
   const result = handler(buildEvent('/docs/foo', 'www.iii.dev'))
   assert.ok(isRedirect(result))
-  assert.equal(
-    locationOf(result),
-    'https://docs.iii.dev/docs/foo',
-    'docs redirect must win over www→apex redirect to avoid a 2-hop chain',
-  )
+  assert.equal(locationOf(result), 'https://iii.dev/docs/foo')
 })
 
 test('/ (root) → pass through unchanged', () => {
@@ -157,10 +141,10 @@ test('/.well-known/foo (no extension) → pass through, NOT SPA rewritten', () =
   assert.equal(result.uri, '/.well-known/foo', '.well-known is an explicit exemption from SPA fallback')
 })
 
-test('missing host header → still handles other rules correctly', () => {
-  const event = buildEvent('/docs/foo', undefined)
+test('missing host header → SPA fallback still applies for extensionless paths', () => {
+  const event = buildEvent('/some/page', undefined)
   delete event.request.headers.host
   const result = handler(event)
-  assert.ok(isRedirect(result))
-  assert.equal(locationOf(result), 'https://docs.iii.dev/docs/foo')
+  assert.ok(!isRedirect(result))
+  assert.equal(result.uri, '/index.html')
 })

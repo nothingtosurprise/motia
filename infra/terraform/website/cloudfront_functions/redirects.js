@@ -1,5 +1,4 @@
 // Viewer-request handler for the default (S3) behavior. Tested in redirects.test.js.
-// /docs redirects preserve the /docs prefix because Mintlify serves content under /docs/...
 
 function redirect(location) {
   return {
@@ -18,10 +17,6 @@ function handler(event) {
   var request = event.request
   var uri = request.uri
   var host = request.headers && request.headers.host ? request.headers.host.value : undefined
-
-  if (uri === '/docs') return redirect('https://docs.iii.dev/docs')
-  if (uri === '/docs/') return redirect('https://docs.iii.dev/docs/')
-  if (uri.indexOf('/docs/') === 0) return redirect(`https://docs.iii.dev${uri}`)
 
   if (host === 'www.iii.dev') return redirect(`https://iii.dev${uri}`)
 

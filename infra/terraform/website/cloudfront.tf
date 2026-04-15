@@ -28,7 +28,7 @@ resource "aws_cloudfront_origin_access_control" "site" {
 resource "aws_cloudfront_function" "redirects" {
   name    = "iii-website-prod-redirects"
   runtime = "cloudfront-js-2.0"
-  comment = "viewer-request: www->apex, /docs->docs.iii.dev, /llms.txt redirect, SPA fallback"
+  comment = "viewer-request (default behavior only): www->apex, SPA fallback"
   publish = true
   code    = file("${path.module}/cloudfront_functions/redirects.js")
 }
@@ -118,6 +118,23 @@ resource "aws_cloudfront_distribution" "site" {
     }
   }
 
+  # domain_name is docs.iii.dev so origin TLS SNI matches iii-dev-tls-docs at
+  # ingress-nginx; the /docs* behaviors forward Host: iii.dev via AllViewer.
+  # Coupled to docs.iii.dev staying on the k8s NLB (see NEXT-STEPS.md item 13).
+  origin {
+    origin_id   = "docs-nlb"
+    domain_name = var.docs_domain
+
+    custom_origin_config {
+      http_port                = 80
+      https_port               = 443
+      origin_protocol_policy   = "https-only"
+      origin_ssl_protocols     = ["TLSv1.2"]
+      origin_keepalive_timeout = 5
+      origin_read_timeout      = 30
+    }
+  }
+
   default_cache_behavior {
     target_origin_id       = "s3-site"
     viewer_protocol_policy = "redirect-to-https"
@@ -148,6 +165,35 @@ resource "aws_cloudfront_distribution" "site" {
     response_headers_policy_id = aws_cloudfront_response_headers_policy.site.id
 
     # No function_association: SPA fallback must not rewrite /api/search responses.
+  }
+
+  # Two behaviors because CloudFront path patterns are literal: /docs matches
+  # only the exact path, /docs/* matches everything under it.
+  # No function_association: the redirects function's SPA fallback would rewrite
+  # /docs/quickstart to /index.html.
+  # No response_headers_policy: the site CSP would break Mintlify's inline scripts.
+  ordered_cache_behavior {
+    path_pattern           = "/docs"
+    target_origin_id       = "docs-nlb"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id          = local.cache_policy_disabled_id
+    origin_request_policy_id = local.origin_request_all_viewer_id
+  }
+
+  ordered_cache_behavior {
+    path_pattern           = "/docs/*"
+    target_origin_id       = "docs-nlb"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id          = local.cache_policy_disabled_id
+    origin_request_policy_id = local.origin_request_all_viewer_id
   }
 
   viewer_certificate {
