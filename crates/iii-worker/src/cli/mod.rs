@@ -11,6 +11,7 @@ pub mod config_file;
 pub mod firmware;
 pub mod lifecycle;
 pub mod local_worker;
+pub mod lockfile;
 pub mod managed;
 pub mod pidfile;
 pub mod project;
