@@ -93,10 +93,7 @@ test('www.iii.dev preserves querystring with multiValue and empty params', () =>
     }),
   )
   assert.ok(isRedirect(result))
-  assert.equal(
-    locationOf(result),
-    'https://iii.dev/some/page?a=1&a=2&empty=&ref=hello%20world',
-  )
+  assert.equal(locationOf(result), 'https://iii.dev/some/page?a=1&a=2&empty=&ref=hello%20world')
 })
 
 test('www.iii.dev with no querystring → no trailing ?', () => {
@@ -115,10 +112,7 @@ test('www.iii.dev percent-encodes reserved chars in keys and values', () => {
     }),
   )
   assert.ok(isRedirect(result))
-  assert.equal(
-    locationOf(result),
-    'https://iii.dev/p?weird%20key=a%26b%3Dc%2Bd%23e',
-  )
+  assert.equal(locationOf(result), 'https://iii.dev/p?weird%20key=a%26b%3Dc%2Bd%23e')
 })
 
 test('SPA fallback preserves querystring on the request object (no rewrite)', () => {
@@ -149,6 +143,24 @@ test('/manifesto → rewrite uri to /manifesto.html (flat HTML, Option A)', () =
   const result = handler(buildEvent('/manifesto', 'iii.dev'))
   assert.ok(!isRedirect(result))
   assert.equal(result.uri, '/manifesto.html')
+})
+
+test('/manifesto.html → pass through unchanged', () => {
+  const result = handler(buildEvent('/manifesto.html', 'iii.dev'))
+  assert.ok(!isRedirect(result))
+  assert.equal(result.uri, '/manifesto.html')
+})
+
+test('/manifesto/ trailing slash → pass through (pretty-URL rewrite only matches exact extensionless path)', () => {
+  const result = handler(buildEvent('/manifesto/', 'iii.dev'))
+  assert.ok(!isRedirect(result))
+  assert.equal(result.uri, '/manifesto/')
+})
+
+test('www.iii.dev/manifesto → 301 https://iii.dev/manifesto (host-redirect runs before pretty-URL rewrite)', () => {
+  const result = handler(buildEvent('/manifesto', 'www.iii.dev'))
+  assert.ok(isRedirect(result))
+  assert.equal(locationOf(result), 'https://iii.dev/manifesto')
 })
 
 test('/AGENTS.md → pass through unchanged', () => {
