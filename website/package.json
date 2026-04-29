@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "description": "iii.dev — minimal static HTML site",
   "scripts": {
-    "dev": "browser-sync start --server --port 3000 --no-notify --no-open --files '*.html, *.css, fonts/*'",
+    "dev": "browser-sync start --server --port 3000 --no-online --no-notify --no-open --files '*.html, *.css, fonts/*'",
     "build": "echo 'static site — nothing to build'",
     "preview": "browser-sync start --server --port 3000 --no-notify --no-open"
   },

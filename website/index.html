@@ -209,7 +209,7 @@
   :root[data-theme="dark"] .ag-node-group.is-agent .hv-node-ring{ fill: var(--bg); }
   *{box-sizing:border-box}
   html{scroll-behavior:smooth;}
-  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:'Chivo Mono', ui-monospace, monospace;font-weight:400;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;font-variant-ligatures:none;font-feature-settings:"liga" 0, "clig" 0, "calt" 0, "dlig" 0;text-rendering:geometricPrecision;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:'Chivo Mono', ui-monospace, monospace;font-weight:400;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;font-variant-ligatures:none;font-feature-settings:"liga" 0, "clig" 0, "calt" 0, "dlig" 0;text-rendering:geometricPrecision;overflow-x:hidden;overflow-x:clip;}
   /* Anchored sections land below the sticky navbar */
   #experience, #nutshell, #workers, #hello, #footer, #install, #primitives{
     scroll-margin-top:90px;
@@ -984,7 +984,9 @@
     .hero-headline{ letter-spacing:-0.02em; }
     .hero-cta{ gap:28px; order: 2; }
     .hero-left{ order: 1; }
-    .hero-viz{ order: 3; }
+    .hero-viz{ order: 3; min-width:0; max-width:100%; overflow:hidden; }
+    .hero-viz-canvas{ overflow:hidden; max-width:100%; }
+    .hero-viz-head .label{ display:none; }
     .email-row input{ width:100%; }
     .email-form{ width:100%; max-width:none; }
   }
@@ -3155,6 +3157,55 @@
     }
   }
 
+  /* ============= CONSOLE — mobile per-panel decluttering ============= */
+  @media (max-width: 1024px){
+    /* Workers: hide right-side metadata (host · pid · fn count · age) */
+    .cs-panel[data-idx="0"] .cs-row-worker .cs-row-meta{ display:none; }
+
+    /* Functions: hide right-side invoke dialog, list spans full width */
+    .cs-panel[data-idx="1"] .cs-card-split{ grid-template-columns: 1fr; }
+    .cs-panel[data-idx="1"] .cs-fn-side{ display:none; }
+
+    /* Triggers: same pattern as Functions */
+    .cs-panel[data-idx="2"] .cs-card-split{ grid-template-columns: 1fr; }
+    .cs-panel[data-idx="2"] .cs-fn-side{ display:none; }
+
+    /* States: hide groups column AND right-side detail aside */
+    .cs-panel[data-idx="3"] .cs-card-split.states{ grid-template-columns: 1fr; }
+    .cs-panel[data-idx="3"] .cs-states-groups,
+    .cs-panel[data-idx="3"] .cs-fn-side{ display:none; }
+
+    /* Streams: drop the ws://… address chip, let stats wrap */
+    .cs-panel[data-idx="4"] .cs-card-bar.streams{ gap:12px; flex-wrap:wrap; }
+    .cs-panel[data-idx="4"] .cs-card-bar.streams .cs-card-bar-right{ display:none; }
+
+    /* Queues: progress meter onto its own row below name/meta */
+    .cs-panel[data-idx="5"] .cs-row-queue{
+      grid-template-columns: 24px 1fr auto;
+      grid-template-areas:
+        "ico  name chev"
+        "ico  meta chev"
+        "meter meter meter";
+      row-gap:6px;
+    }
+    .cs-panel[data-idx="5"] .cs-row-queue > .cs-row-glyph  { grid-area:ico; }
+    .cs-panel[data-idx="5"] .cs-row-queue > .cs-row-name   { grid-area:name; }
+    .cs-panel[data-idx="5"] .cs-row-queue > .cs-row-meta   { grid-area:meta; }
+    .cs-panel[data-idx="5"] .cs-row-queue > .cs-row-chev   { grid-area:chev; }
+    .cs-panel[data-idx="5"] .cs-row-queue > .cs-queue-meter{ grid-area:meter; width:100%; }
+
+    /* Traces: hide colored span bars, give name + ts the room */
+    .cs-panel[data-idx="6"] .cs-trace-row{ grid-template-columns: 14px 1fr auto; }
+    .cs-panel[data-idx="6"] .cs-trace-bars{ display:none; }
+
+    /* Logs: hide the toolbar row (filters + search + severity legend) */
+    .cs-panel[data-idx="7"] .cs-card-bar{ display:none; }
+
+    /* Config: keep stats strip + worker-pools; hide service URL cards and trigger-type pills */
+    .cs-panel[data-idx="8"] .cs-config-row{ display:none; }
+    .cs-panel[data-idx="8"] .cs-config-section:first-of-type{ display:none; }
+  }
+
   /* ============= FOOTER ============= */
   .foot{
     position:relative;
@@ -3190,7 +3241,7 @@
   .foot-row{
     display:grid; grid-template-columns:1fr 1fr;
     gap:16px;
-    max-width:680px; margin:0 auto 28px;
+    margin:0 auto 28px;
   }
   .foot-row > *{
     border:1px solid var(--rule);
@@ -3220,39 +3271,52 @@
   .foot-install .copy-ico svg{ width:14px; height:14px; }
   .foot-install.copied .copy-ico{ color:var(--accent); }
   .foot-email{
-    display:flex; align-items:center;
-    background:var(--bg);
+    position:relative;
+    display:flex; flex-direction:column; justify-content:center;
+    background:transparent;
     padding:0;
   }
+  /* Override .foot-row > * card border so email is underline-only, like the hero form */
+  .foot-row > .foot-email,
+  .foot-cta .foot-row > .foot-email,
+  :root[data-theme="dark"] .foot-cta .foot-row > .foot-email{ border:none; }
+  .foot-email .row{
+    display:flex; align-items:center; width:100%;
+    position:relative;
+    border-bottom:1px solid color-mix(in srgb, var(--bg) 32%, transparent);
+    transition: border-color .15s;
+  }
+  .foot-email .row:focus-within{ border-bottom-color:var(--accent); }
   .foot-email input{
     flex:1; min-width:0;
-    border:none; outline:none; background:transparent;
-    padding:14px 14px 14px 18px;
+    appearance:none; border:0; outline:none; background:transparent;
+    padding:10px 32px 10px 2px;
     font-family:'Chivo Mono', ui-monospace, monospace;
     font-size:13px;
-    color:var(--ink);
+    color:var(--bg);
   }
-  .foot-email input::placeholder{ color:var(--ink); opacity:.55; }
-  .foot-cta .foot-email input,
-  .foot-cta .foot-email input::placeholder{ color:var(--ink); }
-  .foot-cta .foot-email input::placeholder{ opacity:.55; }
+  .foot-email input::placeholder{ color:color-mix(in srgb, var(--bg) 50%, transparent); }
+  .foot-cta .foot-email input{ color:var(--bg); }
+  .foot-cta .foot-email input::placeholder{ color:color-mix(in srgb, var(--bg) 50%, transparent); }
   .foot-email button{
-    background:transparent; border:none; cursor:pointer;
-    padding:0 18px; height:100%;
+    position:absolute; right:0; top:50%; transform:translateY(-50%);
+    appearance:none; background:transparent; border:0; cursor:pointer;
+    padding:6px 4px; height:auto;
     display:flex; align-items:center; justify-content:center;
-    color:var(--ink);
+    color:var(--bg);
+    transition: color .15s;
   }
   .foot-email button:hover{ color:var(--accent); }
   .foot-email button svg{ width:16px; height:16px; }
-  .foot-email.submitted{ justify-content:center; padding:14px 18px; color:var(--ink-faint); font-size:13px; }
+  .foot-email.submitted{ padding:10px 2px; color:color-mix(in srgb, var(--bg) 65%, transparent); font-size:13px; }
   .foot-email.submitted .row{ display:none; }
-  .foot-email.submitted .thanks{ display:flex; align-items:center; gap:8px; }
+  .foot-email.submitted .thanks{ display:flex; align-items:center; gap:8px; justify-content:center; }
   .foot-email .thanks{ display:none; }
   .foot-email .thanks svg{ width:14px; height:14px; color:var(--accent); }
 
   .foot-social{
     display:grid; grid-template-columns:1fr 1fr; gap:16px;
-    max-width:680px; margin:0 auto;
+    margin:0 auto;
   }
   .foot-gh{ display:flex; }
   .foot-discord{ display:flex; }
@@ -3402,6 +3466,11 @@
     .hello > .hello-trace,
     .hello > .hello-flow-controls{ display:none !important; }
     .hello-mflow{ display:flex !important; }
+    /* Let horizontal swipe on the code area page the carousel instead of
+       getting trapped in the inner code scroller. */
+    .hello-mflow-slide .hello-code{ overflow-x:hidden; touch-action:pan-y; white-space:pre-wrap; word-break:break-word; }
+    .hello-mflow-slide .hello-card,
+    .hello-mflow-caption{ touch-action:pan-y; }
   }
   @media (min-width: 881px){
     .hello-mflow{ display:none !important; }
@@ -4214,9 +4283,9 @@
 
 
   <!-- HELLO WORLD -->
-  <section class="hello" id="hello" aria-label="One protocol. Any language.">
+  <section class="hello" id="hello" aria-label="any language. one protocol.">
     <header class="hello-head">
-      <h2 class="hello-title"><span class="accent">any language.</span> <span class="mute"><b style="color:var(--ink); font-weight:500">one protocol.</b> python registers a function. rust registers a function. node consumes both.</span></h2>
+      <h2 class="hello-title"><span class="accent">any language.</span> <span class="mute"><b style="color:var(--ink); font-weight:500">one protocol.</b><br>python registers a function. rust registers a function. node consumes both.</span></h2>
     </header>
 
     <div class="hello-grid" data-mode="flow">
@@ -5252,7 +5321,7 @@ iii.register_function(
   <section class="foot" id="footer" aria-label="Get started">
     <div class="foot-cta">
       <h2 class="foot-title">get started.</h2>
-      <p class="foot-sub">install the engine, check out the code, or subscribe for updates.</p>
+      <p class="foot-sub">install the engine, check out the code, chat with us, or subscribe for updates.</p>
 
       <div class="foot-row">
         <button class="foot-install" id="foot-install" type="button" aria-label="Copy install command">
@@ -5328,8 +5397,8 @@ iii.register_function(
         <h5>contact</h5>
         <ul>
           <li><a href="https://discord.gg/motia" target="_blank" rel="noopener noreferrer">discord</a></li>
-          <li><a href="#">twitter / X</a></li>
-          <li><a href="#">linkedin</a></li>
+          <li><a href="https://x.com/iiidevs">twitter / X</a></li>
+          <li><a href="https://www.linkedin.com/company/iii-dev">linkedin</a></li>
         </ul>
       </div>
     </div>
@@ -6109,30 +6178,29 @@ iii.register_function(
   const installLabel = document.getElementById('install-label');
   const installBtnM = document.getElementById('install-btn-m');
   const installLabelM = document.getElementById('install-label-m');
-  const heroInstallBtn = document.getElementById('hero-install');
-  const heroInstallCmd = document.getElementById('hero-install-cmd');
-  const HERO_INSTALL_DEFAULT = heroInstallCmd ? heroInstallCmd.textContent : '';
-  const HERO_COPY_DEFAULT = heroInstallBtn ? heroInstallBtn.textContent : '';
+  const footInstallBtn = document.getElementById('foot-install');
+  const footInstallCmd = footInstallBtn ? footInstallBtn.querySelector('.cmd') : null;
+  const FOOT_INSTALL_DEFAULT = footInstallCmd ? footInstallCmd.textContent : '';
+  const COPIED_TEXT = 'copied';
+  const COPIED_MS = 4000;
 
   let copyTimer = null;
   function flashCopied(){
-    installBtn.classList.add('copied');
-    installBtnM.classList.add('copied');
-    installLabelM.textContent = 'Copied!';
-    if (heroInstallBtn){
-      heroInstallBtn.classList.add('copied');
-      heroInstallBtn.textContent = 'copied ✓';
-    }
+    if (installBtn) installBtn.classList.add('copied');
+    if (installLabel) installLabel.textContent = COPIED_TEXT;
+    if (installBtnM) installBtnM.classList.add('copied');
+    if (installLabelM) installLabelM.textContent = COPIED_TEXT;
+    if (footInstallBtn) footInstallBtn.classList.add('copied');
+    if (footInstallCmd) footInstallCmd.textContent = COPIED_TEXT;
     clearTimeout(copyTimer);
     copyTimer = setTimeout(() => {
-      installBtn.classList.remove('copied');
-      installBtnM.classList.remove('copied');
-      installLabelM.textContent = 'install.sh';
-      if (heroInstallBtn){
-        heroInstallBtn.classList.remove('copied');
-        heroInstallBtn.textContent = HERO_COPY_DEFAULT;
-      }
-    }, 3000);
+      if (installBtn) installBtn.classList.remove('copied');
+      if (installLabel) installLabel.textContent = 'install.sh';
+      if (installBtnM) installBtnM.classList.remove('copied');
+      if (installLabelM) installLabelM.textContent = 'install.sh';
+      if (footInstallBtn) footInstallBtn.classList.remove('copied');
+      if (footInstallCmd) footInstallCmd.textContent = FOOT_INSTALL_DEFAULT;
+    }, COPIED_MS);
   }
   function copyInstall(){
     if (navigator.clipboard && navigator.clipboard.writeText){
@@ -6141,9 +6209,8 @@ iii.register_function(
       flashCopied();
     }
   }
-  installBtn.addEventListener('click', copyInstall);
-  installBtnM.addEventListener('click', copyInstall);
-  if (heroInstallBtn) heroInstallBtn.addEventListener('click', copyInstall);
+  if (installBtn) installBtn.addEventListener('click', copyInstall);
+  if (installBtnM) installBtnM.addEventListener('click', copyInstall);
 
   // ============= Hero rotating descriptor =============
   const rotatingDescriptors = [
@@ -6524,18 +6591,9 @@ iii.register_function(
 
   // ============= Footer install copy =============
   // Always copies the full install command (same as the navbar). The button's
-  // visible '.cmd' text is intentionally an abbreviated display version.
-  (function footInstall(){
-    const btn = document.getElementById('foot-install');
-    if (!btn) return;
-    btn.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(INSTALL_CMD);
-        btn.classList.add('copied');
-        setTimeout(() => btn.classList.remove('copied'), 1400);
-      } catch(_) {}
-    });
-  })();
+  // visible '.cmd' text is intentionally an abbreviated display version and is
+  // restored after the shared `copied` flash reverts.
+  if (footInstallBtn) footInstallBtn.addEventListener('click', copyInstall);
 
   // ============= Footer email signup =============
   (function footEmail(){
@@ -8235,6 +8293,9 @@ iii.register_function(
   };
 
   let agentG = null, agentLabel = null;
+  // Hoisted so setAgentPos() can position the "agent" label relative to the
+  // harness frame in portrait without re-deriving the dimensions.
+  let harnessW = 0, harnessH = 0;
 
   // Build the static SVG geometry for the given stage. In landscape this
   // doesn't actually depend on stage (only the agent moves), but in portrait
@@ -8320,8 +8381,8 @@ iii.register_function(
 
       // Minimal harness representation around the agent.
       const harnessG = mk('g', { class: 'ag-harness' });
-      const harnessW = useLadder ? 76 : 70;
-      const harnessH = useLadder ? 64 : 56;
+      harnessW = useLadder ? 76 : 70;
+      harnessH = useLadder ? 64 : 56;
       harnessG.appendChild(mk('rect', {
         x: agentToday.x - harnessW/2, y: agentToday.y - harnessH/2,
         width: harnessW, height: harnessH,
@@ -8333,7 +8394,7 @@ iii.register_function(
         class: 'ag-harness-tag',
         'text-anchor': 'middle',
       });
-      hLbl.textContent = 'harness';
+      hLbl.textContent = 'agent harness';
       harnessG.appendChild(hLbl);
       $eH.appendChild(harnessG);
     }
@@ -8360,17 +8421,11 @@ iii.register_function(
   function setAgentPos(stage){
     if (stage === 'today') {
       agentG.setAttribute('transform', `translate(${agentToday.x}, ${agentToday.y})`);
-      // In portrait the agent sits inside the harness; the "agent" label goes
-      // INSIDE the harness frame, centered on the node.
-      if (layout.portrait) {
-        agentLabel.setAttribute('x', agentToday.x);
-        agentLabel.setAttribute('y', agentToday.y + 4);
-        agentLabel.setAttribute('text-anchor', 'middle');
-      } else {
-        agentLabel.setAttribute('x', agentToday.x + 16);
-        agentLabel.setAttribute('y', agentToday.y - 14);
-        agentLabel.setAttribute('text-anchor', 'start');
-      }
+      // Place the "agent" label above the dot, just inside the harness top
+      // edge, so it never overlaps the node mark (portrait OR landscape).
+      agentLabel.setAttribute('x', agentToday.x);
+      agentLabel.setAttribute('y', agentToday.y - harnessH/2 + 10);
+      agentLabel.setAttribute('text-anchor', 'middle');
     } else {
       agentG.setAttribute('transform', `translate(${agentIii.x}, ${agentIii.y})`);
       // Slot 0 in the ring is at the TOP — push the label above it.
