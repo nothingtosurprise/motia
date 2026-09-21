@@ -35,7 +35,7 @@ register_worker(address: &str, options: InitOptions) -> IIIClient
 
   <Expandable title="`InitOptions` fields">
     <ParamField body="metadata" type="Option<iii::WorkerMetadata>">
-      Custom worker metadata. Auto-detected if `None`.
+      Custom worker metadata. Auto-detected if `None`. In managed identity mode, process-wide identity variables override matching fields.
     </ParamField>
     <ParamField body="headers" type="Option<HashMap<String, String>>">
       Custom HTTP headers sent during the WebSocket handshake.
@@ -44,7 +44,10 @@ register_worker(address: &str, options: InitOptions) -> IIIClient
       OpenTelemetry configuration.
     </ParamField>
     <ParamField body="namespace" type="Option<String>">
-      Namespace this worker belongs to. Resolution order: `namespace` > env `III_NAMESPACE` > `None` (the engine then applies its default namespace). Mirrors the `III_WORKER_NAME` precedence. It scopes more than the registration. The worker and its functions register here, and everything the worker does afterwards follows it: a `IIIClient::trigger` resolves its target here and a `IIIClient::register_trigger` binds here, unless the call names another namespace.
+      Namespace this worker belongs to. In managed mode, resolution order is `namespace` > env `III_NAMESPACE` > `None`. In explicit mode, the environment is not used. It scopes more than the registration. The worker and its functions register here, and everything the worker does afterwards follows it: a `IIIClient::trigger` resolves its target here and a `IIIClient::register_trigger` binds here, unless the call names another namespace.
+    </ParamField>
+    <ParamField body="identity" type="WorkerIdentityMode" required>
+      Selects whether process-wide managed identity variables can override this connection's metadata. Auxiliary connections should use `WorkerIdentityMode::Explicit`.
     </ParamField>
   </Expandable>
 </ParamField>
@@ -491,6 +494,29 @@ worker.shutdown_async().await;
 ```
 
 
+---
+
+### wait_until_registered
+
+Wait until the engine accepts this worker's initial registration.
+
+Returns `Error::RegistrationRejected` for a fatal identity conflict,
+`Error::Timeout` when the deadline expires, and
+`Error::NotConnected` when called before the client starts or after it
+stops.
+
+**Signature**
+
+```rust
+async wait_until_registered(timeout: Duration) -> Result<(), Error>
+```
+
+#### Parameters
+
+<ParamField body="timeout" type="Duration" required>
+</ParamField>
+
+
 ## Types
 
 ### iii_sdk
@@ -513,10 +539,11 @@ Configuration options passed to `register_worker`.
 
 | Name | Type | Required | Description |
 | --- | --- | --- | --- |
-| `metadata` | Option&lt;iii::[`WorkerMetadata`](#workermetadata)&gt; | No | Custom worker metadata. Auto-detected if `None`. |
+| `metadata` | Option&lt;iii::[`WorkerMetadata`](#workermetadata)&gt; | No | Custom worker metadata. Auto-detected if `None`. In managed identity<br />mode, process-wide identity variables override matching fields. |
 | `headers` | `Option<HashMap<String, String>>` | No | Custom HTTP headers sent during the WebSocket handshake. |
 | `otel` | `Option<iii_helpers::observability::OtelConfig>` | No | OpenTelemetry configuration. |
-| `namespace` | `Option<String>` | No | Namespace this worker belongs to. Resolution order:<br />`namespace` > env `III_NAMESPACE` > `None` (the engine then applies its<br />default namespace). Mirrors the `III_WORKER_NAME` precedence.<br /><br />It scopes more than the registration. The worker and its functions<br />register here, and everything the worker does afterwards follows it: a<br />`IIIClient::trigger` resolves its target here and a<br />`IIIClient::register_trigger` binds here, unless the call names<br />another namespace. |
+| `namespace` | `Option<String>` | No | Namespace this worker belongs to. In managed mode, resolution order is<br />`namespace` > env `III_NAMESPACE` > `None`. In explicit mode, the<br />environment is not used.<br /><br />It scopes more than the registration. The worker and its functions<br />register here, and everything the worker does afterwards follows it: a<br />`IIIClient::trigger` resolves its target here and a<br />`IIIClient::register_trigger` binds here, unless the call names<br />another namespace. |
+| `identity` | [`WorkerIdentityMode`](#workeridentitymode) | Yes | Selects whether process-wide managed identity variables can override<br />this connection's metadata. Auxiliary connections should use<br />`WorkerIdentityMode::Explicit`. |
 
 ---
 
@@ -1064,7 +1091,7 @@ Trigger request plus optional per-invocation metadata and target namespace.
 
 ### iii_sdk::runtime
 
-[`FunctionInfo`](#functioninfo) · [`FunctionRef`](#functionref) · [`IIIConnectionState`](#iiiconnectionstate) · [`TriggerInfo`](#triggerinfo) · [`TriggerTypeRef`](#triggertyperef) · [`WorkerInfo`](#workerinfo) · [`WorkerMetadata`](#workermetadata)
+[`FunctionInfo`](#functioninfo) · [`FunctionRef`](#functionref) · [`IIIConnectionState`](#iiiconnectionstate) · [`TriggerInfo`](#triggerinfo) · [`TriggerTypeRef`](#triggertyperef) · [`WorkerIdentityMode`](#workeridentitymode) · [`WorkerInfo`](#workerinfo) · [`WorkerMetadata`](#workermetadata)
 
 #### FunctionInfo
 
@@ -1136,6 +1163,17 @@ Type parameters:
 
 ---
 
+#### WorkerIdentityMode
+
+Selects where a worker connection gets its engine identity.
+
+| Name | Type | Required | Description |
+| --- | --- | --- | --- |
+| `Managed` | `unit` | Yes | Use the supervisor-managed `III_WORKER_NAME` and `III_NAMESPACE` values<br />when present. This is the default for normal worker connections. |
+| `Explicit` | `unit` | Yes | Keep the name from `WorkerMetadata` and the namespace from explicit<br />options or metadata. Process-wide identity environment variables are<br />ignored. Use this for auxiliary connections created by one worker. |
+
+---
+
 #### WorkerInfo
 
 Worker information returned by `engine::workers::list`
@@ -1166,13 +1204,13 @@ Worker metadata for auto-registration
 | --- | --- | --- | --- |
 | `runtime` | `String` | Yes | - |
 | `version` | `String` | Yes | - |
-| `name` | `String` | Yes | - |
+| `name` | `String` | Yes | Worker name reported to the engine. In managed identity mode, a<br />non-empty `III_WORKER_NAME` overrides this value when the client is<br />created. |
 | `os` | `String` | Yes | - |
 | `description` | `Option<String>` | No | One-line, human/LLM-readable summary of what this worker does.<br />Surfaces in `engine::workers::list` / `engine::workers::info`. |
 | `pid` | `Option<u32>` | No | - |
 | `telemetry` | Option&lt;[`TelemetryOptions`](#telemetryoptions)&gt; | No | - |
 | `isolation` | `Option<String>` | No | - |
-| `namespace` | `Option<String>` | No | Namespace this worker belongs to, and therefore the one its calls and<br />its trigger bindings resolve in unless they name another. Absent means<br />the engine applies its default namespace. Resolved from<br />`InitOptions.namespace` / `III_NAMESPACE` (see `resolve_namespace`). |
+| `namespace` | `Option<String>` | No | Namespace this worker belongs to, and therefore the one its calls and<br />its trigger bindings resolve in unless they name another. Absent means<br />the engine applies its default namespace. Managed clients also use<br />`III_NAMESPACE` when no explicit namespace is present. |
 
 ### iii_sdk::stream_provider
 

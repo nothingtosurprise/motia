@@ -61,7 +61,7 @@ registerWorker(address?: string, options?: InitOptions) => IIIClient
       One-line, human/LLM-readable summary of what this worker does. Surfaces in `engine::workers::list` / `engine::workers::info`.
     </ParamField>
     <ParamField body="workerName" type="string">
-      Display name for this worker. Defaults to `hostname:pid`.
+      Display name for this worker. A non-empty `III_WORKER_NAME` overrides it. Defaults to `hostname:pid`.
     </ParamField>
   </Expandable>
 </ParamField>
@@ -515,7 +515,7 @@ Configuration options passed to registerWorker.
 | `otel` | `Omit<OtelConfig, "engineWsUrl">` | No | OpenTelemetry configuration. OTel is initialized automatically by default.<br />Set `{ enabled: false }` or env `OTEL_ENABLED=false/0/no/off` to disable.<br />The `engineWsUrl` is set automatically from the III address. |
 | `reconnectionConfig` | `Partial<IIIReconnectionConfig>` | No | WebSocket reconnection behavior. |
 | `workerDescription` | `string` | No | One-line, human/LLM-readable summary of what this worker does.<br />Surfaces in `engine::workers::list` / `engine::workers::info`. |
-| `workerName` | `string` | No | Display name for this worker. Defaults to `hostname:pid`. |
+| `workerName` | `string` | No | Display name for this worker. A non-empty `III_WORKER_NAME` overrides it. Defaults to `hostname:pid`. |
 
 ---
 
