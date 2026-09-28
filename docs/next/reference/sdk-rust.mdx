@@ -774,10 +774,10 @@ A streaming channel pair for worker-to-worker data transfer.
 
 | Name | Type | Required | Description |
 | --- | --- | --- | --- |
-| `writer` | [`ChannelWriter`](#channelwriter) | Yes | - |
-| `reader` | [`ChannelReader`](#channelreader) | Yes | - |
-| `writer_ref` | [`StreamChannelRef`](#streamchannelref) | Yes | - |
-| `reader_ref` | [`StreamChannelRef`](#streamchannelref) | Yes | - |
+| `writer` | crate::[`ChannelWriter`](#channelwriter) | Yes | - |
+| `reader` | crate::[`ChannelReader`](#channelreader) | Yes | - |
+| `writer_ref` | crate::[`StreamChannelRef`](#streamchannelref) | Yes | - |
+| `reader_ref` | crate::[`StreamChannelRef`](#streamchannelref) | Yes | - |
 
 ---
 
@@ -1324,7 +1324,7 @@ Handler trait for custom trigger types. Implement this and pass to
 
 | Name | Type | Required | Description |
 | --- | --- | --- | --- |
-| `message` | [`RegisterFunctionMessage`](#registerfunctionmessage) | Yes | - |
+| `message` | crate::[`RegisterFunctionMessage`](#registerfunctionmessage) | Yes | - |
 | `handler` | `Option<RemoteFunctionHandlerWithMetadata>` | No | - |
 
 ---
@@ -1347,7 +1347,7 @@ type RemoteFunctionHandler = Arc<dyn Fn(Value) -> futures_util::future::BoxFutur
 
 | Name | Type | Required | Description |
 | --- | --- | --- | --- |
-| `message` | [`RegisterTriggerTypeMessage`](#registertriggertypemessage) | Yes | - |
+| `message` | crate::[`RegisterTriggerTypeMessage`](#registertriggertypemessage) | Yes | - |
 | `handler` | Arc&lt;dyn [`TriggerHandler`](#triggerhandler)&gt; | Yes | - |
 
 ---
