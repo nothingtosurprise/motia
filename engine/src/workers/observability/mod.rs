@@ -94,6 +94,11 @@ pub struct TracesListInput {
     /// `engine::traces::spans` and `engine::traces::tree`.
     #[serde(default)]
     attribute_projection: Option<Vec<String>>,
+    /// `engine::traces::spans` only: `false` returns each span without its
+    /// `events` and `links`, where invocation payloads ride, for views that
+    /// draw spans without opening one. Defaults to true.
+    #[serde(default)]
+    include_events: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Default, JsonSchema)]
@@ -739,22 +744,111 @@ fn span_matches_attribute_pairs(span: &otel::StoredSpan, pairs: &[Vec<String>]) 
     })
 }
 
-/// Apply filters whose trace-summary semantics are determined entirely by the
-/// representative root. Returning `true` only means that the trace remains a
-/// candidate: aggregate status, duration/time and child-span searches are
-/// still evaluated after the candidate traces have been loaded in full.
+/// What a filtered trace list learns from the attribute index and the span
+/// names, before any payload is decoded.
+#[derive(Default)]
+struct IndexedListFilters {
+    /// Traces that can satisfy the `search_all_spans` name and attribute
+    /// filters; `None` leaves every trace a candidate.
+    traces: Option<HashSet<String>>,
+    /// Spans carrying every `attributes` pair, when the pairs apply to the
+    /// representative root alone (`search_all_spans` off).
+    representative_attributes: Option<HashSet<(String, String)>>,
+    /// Spans carrying any `exclude_attributes` pair.
+    excluded: HashSet<(String, String)>,
+}
+
+impl IndexedListFilters {
+    fn load(input: &TracesListInput) -> Self {
+        let search_all = input.search_all_spans.unwrap_or(false);
+        // Spans carrying every pair. A malformed pair matches no span, as in
+        // `span_matches_attribute_pairs`; no pairs match every span.
+        let with_attributes = input
+            .attributes
+            .as_deref()
+            .filter(|pairs| !pairs.is_empty())
+            .map(|pairs| {
+                let mut sets = pairs.iter().map(|pair| match pair.as_slice() {
+                    [key, value] => otel::get_query_span_keys_with_attribute(key, value),
+                    _ => HashSet::new(),
+                });
+                let first = sets.next().unwrap_or_default();
+                sets.fold(first, |mut all, set| {
+                    all.retain(|key| set.contains(key));
+                    all
+                })
+            });
+        let excluded = input
+            .exclude_attributes
+            .iter()
+            .flatten()
+            .filter_map(|pair| match pair.as_slice() {
+                [key, value] => Some(otel::get_query_span_keys_with_attribute(key, value)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if !search_all {
+            return Self {
+                traces: None,
+                representative_attributes: with_attributes,
+                excluded,
+            };
+        }
+
+        let attribute_traces: Option<HashSet<String>> =
+            with_attributes.map(|spans| spans.into_iter().map(|(trace_id, _)| trace_id).collect());
+        let named_traces = input
+            .name
+            .as_deref()
+            .map(|name| otel::get_query_trace_ids_with_span_name(&name.to_lowercase()));
+        let traces = match (attribute_traces, named_traces) {
+            (Some(mut attributed), Some(named)) => {
+                attributed.retain(|trace_id| named.contains(trace_id));
+                Some(attributed)
+            }
+            (attributed, named) => attributed.or(named),
+        };
+        Self {
+            traces,
+            representative_attributes: None,
+            excluded,
+        }
+    }
+}
+
+/// Apply the filters that the root keys and the attribute index decide,
+/// before any payload is decoded. Returning `true` only means that the trace
+/// remains a candidate: aggregate status, duration/time and the exact child
+/// span matches are still evaluated after the candidate traces have been
+/// loaded in full.
 fn trace_might_match_root_filters(
-    root_spans: &[otel::StoredSpan],
+    roots: &[trace_store::RootSpanKey],
     input: &TracesListInput,
     include_internal: bool,
+    indexed: &IndexedListFilters,
 ) -> bool {
-    let Some(representative) = representative_trace_span(root_spans) else {
+    let Some(representative) = roots.iter().min_by(|a, b| {
+        a.start_time_ns
+            .cmp(&b.start_time_ns)
+            .then_with(|| a.span_id.cmp(&b.span_id))
+    }) else {
         return false;
     };
 
+    // Search-all matches cover every span, internal ones included, so they
+    // hold whichever span ends up representing the trace.
+    if indexed
+        .traces
+        .as_ref()
+        .is_some_and(|traces| !traces.contains(&representative.trace_id))
+    {
+        return false;
+    }
+
     // After internal rows are removed, a non-internal child can become the
     // representative root. Keep these traces for the exact post-load pass.
-    if !include_internal && is_internal_span(representative) {
+    if !include_internal && representative.is_internal {
         return true;
     }
 
@@ -767,36 +861,28 @@ fn trace_might_match_root_filters(
         return false;
     }
 
-    let search_all = input.search_all_spans.unwrap_or(false);
-    if !search_all {
-        if let Some(name) = input.name.as_deref()
-            && !representative
-                .name
-                .to_lowercase()
-                .contains(&name.to_lowercase())
-        {
-            return false;
-        }
-        if let Some(pairs) = input.attributes.as_deref()
-            && !span_matches_attribute_pairs(representative, pairs)
-        {
-            return false;
-        }
-    }
-
-    if let Some(excluded) = input.exclude_attributes.as_deref()
-        && excluded.iter().any(|pair| {
-            pair.len() == 2
-                && representative
-                    .attributes
-                    .iter()
-                    .any(|(key, value)| key == &pair[0] && value == &pair[1])
-        })
+    if !input.search_all_spans.unwrap_or(false)
+        && let Some(name) = input.name.as_deref()
+        && !representative
+            .name
+            .to_lowercase()
+            .contains(&name.to_lowercase())
     {
         return false;
     }
 
-    true
+    let key = (
+        representative.trace_id.clone(),
+        representative.span_id.clone(),
+    );
+    if indexed
+        .representative_attributes
+        .as_ref()
+        .is_some_and(|spans| !spans.contains(&key))
+    {
+        return false;
+    }
+    !indexed.excluded.contains(&key)
 }
 
 fn trace_matches_list_filters(
@@ -2415,26 +2501,29 @@ impl ObservabilityWorker {
                 let query_input = input.clone();
                 let query_view = run_blocking_query("traces::list summary view", move || {
                     if unfiltered {
-                        let mut roots = otel::get_query_root_spans();
+                        // Keys only: sorting and paging never decode a
+                        // payload, so the cost tracks the root count rather
+                        // than the size of the stored history.
+                        let mut roots = otel::get_query_root_span_keys();
                         if !include_internal {
-                            roots.retain(|span| !is_internal_span(span));
+                            roots.retain(|root| !root.is_internal);
                         }
                         roots.sort_by(|a, b| {
                             let cmp = a
-                                .start_time_unix_nano
-                                .cmp(&b.start_time_unix_nano)
+                                .start_time_ns
+                                .cmp(&b.start_time_ns)
                                 .then_with(|| a.trace_id.cmp(&b.trace_id))
                                 .then_with(|| a.span_id.cmp(&b.span_id));
                             if sort_order_asc { cmp } else { cmp.reverse() }
                         });
                         let mut seen = HashSet::new();
-                        roots.retain(|span| seen.insert(span.trace_id.clone()));
+                        roots.retain(|root| seen.insert(root.trace_id.clone()));
                         let total = roots.len();
                         let trace_ids: Vec<String> = roots
                             .into_iter()
                             .skip(offset)
                             .take(limit)
-                            .map(|span| span.trace_id)
+                            .map(|root| root.trace_id)
                             .collect();
                         (otel::get_query_spans_by_trace_ids(&trace_ids), Some(total))
                     } else if let Some(trace_id) = query_trace_id {
@@ -2442,13 +2531,18 @@ impl ObservabilityWorker {
                     } else if let Some(trace_ids) = query_trace_ids {
                         (otel::get_query_spans_by_trace_ids(&trace_ids), None)
                     } else {
-                        // Root-level filters can reject traces before their
-                        // child payloads are decoded. Filters that depend on
-                        // aggregate/child data are deliberately deferred to
-                        // the exact pass below.
-                        let roots = otel::get_query_root_spans();
-                        let mut roots_by_trace = HashMap::<String, Vec<otel::StoredSpan>>::new();
-                        for root in roots {
+                        // The root keys and the attribute index reject
+                        // traces before any payload is decoded; only the
+                        // candidates left are read in full for the exact
+                        // pass below.
+                        // ponytail: status, duration and time filters, and
+                        // hidden-function exclusions alone, narrow nothing
+                        // here, so they still read most traces in full; a
+                        // per-trace aggregate query would page them too.
+                        let indexed = IndexedListFilters::load(&query_input);
+                        let mut roots_by_trace =
+                            HashMap::<String, Vec<trace_store::RootSpanKey>>::new();
+                        for root in otel::get_query_root_span_keys() {
                             roots_by_trace
                                 .entry(root.trace_id.clone())
                                 .or_default()
@@ -2456,11 +2550,12 @@ impl ObservabilityWorker {
                         }
                         let trace_ids: Vec<String> = roots_by_trace
                             .into_iter()
-                            .filter_map(|(trace_id, root_spans)| {
+                            .filter_map(|(trace_id, roots)| {
                                 trace_might_match_root_filters(
-                                    &root_spans,
+                                    &roots,
                                     &query_input,
                                     include_internal,
+                                    &indexed,
                                 )
                                 .then_some(trace_id)
                             })
@@ -2844,9 +2939,14 @@ impl ObservabilityWorker {
                     };
                 let tag_elapsed = tag_started.elapsed();
                 let serialization_started = Instant::now();
+                let include_events = input.include_events.unwrap_or(true);
                 let result_spans: Vec<Value> = spans
                     .into_iter()
-                    .map(|s| {
+                    .map(|mut s| {
+                        if !include_events {
+                            s.events.clear();
+                            s.links.clear();
+                        }
                         let tags = tags_by_trace_id
                             .get(&s.trace_id)
                             .cloned()
@@ -4047,21 +4147,7 @@ impl Worker for ObservabilityWorker {
                                 archive.mark_degraded(error);
                             }
                         }
-                        // The hot cache is bounded, but glibc keeps the pages
-                        // its churn freed. Hand them back so RSS follows the
-                        // cache instead of the last burst (MOT-4733).
-                        if let Ok(Some((before, after))) =
-                            tokio::task::spawn_blocking(crate::memory::release_freed_memory).await
-                        {
-                            let released = before.saturating_sub(after);
-                            if released >= 64 << 20 {
-                                tracing::info!(
-                                    released_mb = released >> 20,
-                                    rss_mb = after >> 20,
-                                    "returned freed heap to the OS"
-                                );
-                            }
-                        }
+
                     }
                 }
             }
@@ -6128,71 +6214,133 @@ mod tests {
 
     #[test]
     fn trace_root_candidate_filter_only_rejects_root_determined_mismatches() {
-        let root = make_span(
-            "trace",
-            "root",
-            None,
-            "checkout request",
-            "checkout",
-            1,
-            2,
-            "ok",
-            vec![("tenant", "alpha")],
-        );
+        let root_key = |span_id: &str, name: &str, service: &str, start: u64, internal: bool| {
+            trace_store::RootSpanKey {
+                trace_id: "trace".to_string(),
+                span_id: span_id.to_string(),
+                parent_span_id: None,
+                name: name.to_string(),
+                service_name: service.to_string(),
+                start_time_ns: start,
+                is_internal: internal,
+            }
+        };
+        let might_match = |roots: &[trace_store::RootSpanKey],
+                           input: TracesListInput,
+                           indexed: &IndexedListFilters| {
+            trace_might_match_root_filters(roots, &input, false, indexed)
+        };
+        let root = root_key("root", "checkout request", "checkout", 1, false);
+        let root_span = || ("trace".to_string(), "root".to_string());
+        let unconstrained = IndexedListFilters::default();
 
-        assert!(!trace_might_match_root_filters(
+        assert!(!might_match(
             std::slice::from_ref(&root),
-            &TracesListInput {
+            TracesListInput {
                 service_name: Some("billing".to_string()),
                 ..Default::default()
             },
-            false,
+            &unconstrained,
         ));
-        assert!(!trace_might_match_root_filters(
+        assert!(!might_match(
             std::slice::from_ref(&root),
-            &TracesListInput {
+            TracesListInput {
                 name: Some("child operation".to_string()),
                 ..Default::default()
             },
-            false,
+            &unconstrained,
         ));
-        assert!(trace_might_match_root_filters(
+        // A search-all name is the index's call, not the root's.
+        assert!(might_match(
             std::slice::from_ref(&root),
-            &TracesListInput {
+            TracesListInput {
                 name: Some("child operation".to_string()),
                 search_all_spans: Some(true),
                 ..Default::default()
             },
-            false,
+            &unconstrained,
         ));
-        assert!(trace_might_match_root_filters(
+        assert!(might_match(
             std::slice::from_ref(&root),
-            &TracesListInput {
+            TracesListInput {
                 // Aggregate status cannot be decided from the root alone.
                 status: Some("error".to_string()),
                 ..Default::default()
             },
-            false,
+            &unconstrained,
         ));
 
-        let internal_root = make_span(
-            "internal-trace",
-            "internal-root",
-            None,
-            "internal",
-            "iii",
-            1,
-            2,
-            "ok",
-            vec![("function_id", "engine::traces::list")],
-        );
-        assert!(trace_might_match_root_filters(
-            &[internal_root],
-            &TracesListInput {
+        // The index's verdicts, read against the representative root.
+        let reject_all_traces = IndexedListFilters {
+            traces: Some(HashSet::new()),
+            ..Default::default()
+        };
+        assert!(!might_match(
+            std::slice::from_ref(&root),
+            TracesListInput::default(),
+            &reject_all_traces,
+        ));
+        assert!(!might_match(
+            std::slice::from_ref(&root),
+            TracesListInput::default(),
+            &IndexedListFilters {
+                representative_attributes: Some(HashSet::new()),
+                ..Default::default()
+            },
+        ));
+        assert!(might_match(
+            std::slice::from_ref(&root),
+            TracesListInput::default(),
+            &IndexedListFilters {
+                representative_attributes: Some(HashSet::from([root_span()])),
+                ..Default::default()
+            },
+        ));
+        let excluding_root = IndexedListFilters {
+            excluded: HashSet::from([root_span()]),
+            ..Default::default()
+        };
+        assert!(!might_match(
+            std::slice::from_ref(&root),
+            TracesListInput::default(),
+            &excluding_root,
+        ));
+
+        // The earliest root represents the trace.
+        let later = root_key("later", "late branch", "billing", 5, false);
+        assert!(might_match(
+            &[later.clone(), root.clone()],
+            TracesListInput {
+                service_name: Some("checkout".to_string()),
+                ..Default::default()
+            },
+            &unconstrained,
+        ));
+        assert!(!might_match(
+            &[later, root],
+            TracesListInput {
+                service_name: Some("billing".to_string()),
+                ..Default::default()
+            },
+            &unconstrained,
+        ));
+
+        // An internal representative is settled after load, since a
+        // non-internal child can take its place, except for search-all
+        // verdicts, which cover every span.
+        let internal_root = root_key("root", "internal", "iii", 1, true);
+        assert!(might_match(
+            std::slice::from_ref(&internal_root),
+            TracesListInput {
                 service_name: Some("application".to_string()),
                 ..Default::default()
             },
-            false,
+            &excluding_root,
+        ));
+        assert!(!might_match(
+            &[internal_root],
+            TracesListInput::default(),
+            &reject_all_traces,
         ));
     }
 
@@ -7861,6 +8009,7 @@ mod tests {
             include_internal: Some(false),
             search_all_spans: None,
             attribute_projection: None,
+            include_events: None,
         };
 
         let spans = match module.list_trace_spans(input).await {
@@ -7946,6 +8095,7 @@ mod tests {
             include_internal: Some(false),
             search_all_spans: None,
             attribute_projection: None,
+            include_events: None,
         };
 
         let order = |result: FunctionResult<TracesSpansResult, ErrorBody>| -> Vec<String> {
@@ -8075,6 +8225,7 @@ mod tests {
                 include_internal: Some(false),
                 search_all_spans: None,
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -8299,6 +8450,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: Some(true),
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -8380,6 +8532,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: Some(false),
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
         match result_root_only {
@@ -8412,6 +8565,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: Some(true),
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
         match result_all {
@@ -8488,6 +8642,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: Some(false),
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -8964,6 +9119,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: None,
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -8983,6 +9139,66 @@ mod tests {
             }
             _ => panic!("expected list_traces success"),
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_trace_spans_without_events_keep_everything_else() {
+        reset_observability_test_state();
+
+        let module = make_test_module(Arc::new(Engine::new()));
+        let span_storage = otel::get_span_storage().expect("span storage should exist");
+        span_storage.clear();
+        let mut span = make_span(
+            "t-1",
+            "s-1",
+            None,
+            "call tool",
+            "svc",
+            1,
+            2,
+            "ok",
+            vec![("iii.session.id", "s1")],
+        );
+        span.events = vec![otel::StoredSpanEvent {
+            name: "invocation".to_string(),
+            timestamp_unix_nano: 1,
+            attributes: vec![("iii.payload.json".to_string(), "{\"big\":true}".to_string())],
+        }];
+        span.links = vec![otel::StoredSpanLink {
+            trace_id: "t-0".to_string(),
+            span_id: "s-0".to_string(),
+            trace_state: None,
+            attributes: vec![],
+        }];
+        span_storage.add_spans(vec![span]);
+
+        let spans = |include_events: Option<bool>| {
+            module.list_trace_spans(TracesListInput {
+                trace_ids: Some(vec!["t-1".to_string()]),
+                include_events,
+                ..Default::default()
+            })
+        };
+        let only = |result: FunctionResult<TracesSpansResult, ErrorBody>| match result {
+            FunctionResult::Success(value) => {
+                assert_eq!(value.spans.len(), 1);
+                value.spans[0].clone()
+            }
+            _ => panic!("expected list_trace_spans success"),
+        };
+
+        let full = only(spans(None).await);
+        assert_eq!(full["events"][0]["name"], "invocation");
+        assert_eq!(full["links"][0]["span_id"], "s-0");
+
+        let bare = only(spans(Some(false)).await);
+        assert_eq!(bare["events"], serde_json::json!([]));
+        assert_eq!(bare["links"], serde_json::json!([]));
+        let mut rest = full.clone();
+        rest["events"] = serde_json::json!([]);
+        rest["links"] = serde_json::json!([]);
+        assert_eq!(bare, rest, "only events and links are dropped");
     }
 
     #[tokio::test]
@@ -9049,6 +9265,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: None,
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -9341,6 +9558,516 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_trace_summaries_page_archived_roots_from_keys_one_row_per_trace() {
+        reset_observability_test_state();
+        let directory = tempfile::tempdir().expect("temp trace directory");
+        let _guard = attach_test_archive(directory.path());
+
+        let module = make_test_module(Arc::new(Engine::new()));
+        let span_storage = otel::get_span_storage().expect("span storage should exist");
+        span_storage.clear();
+        span_storage.add_spans(vec![
+            make_span("t-1", "r-1", None, "one", "svc", 1, 10, "ok", vec![]),
+            make_span(
+                "t-1",
+                "c-1",
+                Some("r-1"),
+                "one child",
+                "svc",
+                2,
+                9,
+                "ok",
+                vec![],
+            ),
+            // A second dangling root of the same distributed trace.
+            make_span(
+                "t-1",
+                "r-remote",
+                Some("remote-parent"),
+                "remote branch",
+                "svc",
+                3,
+                8,
+                "ok",
+                vec![],
+            ),
+            make_span("t-2", "r-2", None, "two", "svc", 20, 30, "ok", vec![]),
+            make_span(
+                "t-int",
+                "r-int",
+                None,
+                "internal",
+                "svc",
+                25,
+                26,
+                "ok",
+                vec![("function_id", "engine::traces::list")],
+            ),
+        ]);
+        flush_test_archive();
+        span_storage.clear();
+        // Hot-only: the newest trace, not archived yet.
+        span_storage.add_spans(vec![make_span(
+            "t-3",
+            "r-3",
+            None,
+            "three",
+            "svc",
+            40,
+            50,
+            "ok",
+            vec![],
+        )]);
+
+        let page = |offset: usize, limit: usize, order: &str, include_internal: bool| {
+            module.list_traces(TracesListInput {
+                offset: Some(offset),
+                limit: Some(limit),
+                sort_order: Some(order.to_string()),
+                include_internal: Some(include_internal),
+                ..Default::default()
+            })
+        };
+        let ids = |value: &TracesListResult| {
+            value
+                .traces
+                .iter()
+                .map(|trace| trace.trace_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        match page(0, 1, "asc", false).await {
+            FunctionResult::Success(value) => {
+                assert_eq!(value.total, 3, "one row per trace, internal excluded");
+                assert_eq!(ids(&value), vec!["t-1"]);
+                assert_eq!(value.traces[0].span_count, 3, "the page reads full spans");
+            }
+            _ => panic!("expected list_traces success"),
+        }
+        match page(0, 2, "desc", false).await {
+            FunctionResult::Success(value) => {
+                assert_eq!(ids(&value), vec!["t-3", "t-2"], "hot and archived merge");
+            }
+            _ => panic!("expected list_traces success"),
+        }
+        match page(1, 2, "desc", true).await {
+            FunctionResult::Success(value) => {
+                assert_eq!(value.total, 4);
+                assert_eq!(ids(&value), vec!["t-int", "t-2"]);
+            }
+            _ => panic!("expected list_traces success"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_traces_never_takes_a_hot_child_of_an_archived_span_for_a_root() {
+        reset_observability_test_state();
+        let directory = tempfile::tempdir().expect("temp trace directory");
+        let _guard = attach_test_archive(directory.path());
+
+        let module = make_test_module(Arc::new(Engine::new()));
+        let span_storage = otel::get_span_storage().expect("span storage should exist");
+        span_storage.clear();
+        // Archived: an internal root and its child.
+        span_storage.add_spans(vec![
+            make_span(
+                "t-int",
+                "r-int",
+                None,
+                "internal",
+                "svc",
+                10,
+                100,
+                "ok",
+                vec![("function_id", "engine::traces::list")],
+            ),
+            make_span(
+                "t-int",
+                "c-int",
+                Some("r-int"),
+                "child",
+                "svc",
+                20,
+                90,
+                "ok",
+                vec![],
+            ),
+        ]);
+        flush_test_archive();
+        span_storage.clear();
+        // Hot: a grandchild whose parent lives only in the archive, as a
+        // non-root the root view never loads. It is not a root.
+        span_storage.add_spans(vec![
+            make_span(
+                "t-int",
+                "g-int",
+                Some("c-int"),
+                "grandchild",
+                "svc",
+                50,
+                60,
+                "ok",
+                vec![],
+            ),
+            make_span(
+                "t-ext",
+                "r-ext",
+                None,
+                "external",
+                "svc",
+                40,
+                45,
+                "ok",
+                vec![],
+            ),
+        ]);
+
+        let list = |include_internal: bool| {
+            module.list_traces(TracesListInput {
+                include_internal: Some(include_internal),
+                sort_order: Some("desc".to_string()),
+                ..Default::default()
+            })
+        };
+        let ids = |result: FunctionResult<TracesListResult, ErrorBody>| match result {
+            FunctionResult::Success(value) => value
+                .traces
+                .iter()
+                .map(|trace| trace.trace_id.clone())
+                .collect::<Vec<_>>(),
+            _ => panic!("expected list_traces success"),
+        };
+
+        // The internal trace stays hidden, and with internals it sorts by its
+        // real root (start 10), not by the grandchild (start 50).
+        assert_eq!(ids(list(false).await), vec!["t-ext"]);
+        assert_eq!(ids(list(true).await), vec!["t-ext", "t-int"]);
+    }
+
+    /// The filtered list with no pre-filter at all: every trace read in full
+    /// and settled by the exact pass, sorted like `list_traces`.
+    fn exact_trace_list(input: &TracesListInput) -> Vec<String> {
+        let include_internal = input.include_internal.unwrap_or(false);
+        let mut trace_ids: Vec<String> = otel::get_query_root_span_keys()
+            .into_iter()
+            .map(|root| root.trace_id)
+            .collect();
+        trace_ids.sort();
+        trace_ids.dedup();
+        let mut by_trace = HashMap::<String, Vec<otel::StoredSpan>>::new();
+        for span in otel::get_query_spans_by_trace_ids(&trace_ids) {
+            if include_internal || !is_internal_span(&span) {
+                by_trace
+                    .entry(span.trace_id.clone())
+                    .or_default()
+                    .push(span);
+            }
+        }
+        let now_ns = otel::now_unix_nanos();
+        let mut summaries: Vec<TraceSummary> = by_trace
+            .into_values()
+            .filter_map(|spans| {
+                let summary = summarize_trace(&spans, &HashSet::new())?;
+                trace_matches_list_filters(&summary, &spans, input, now_ns).then_some(summary)
+            })
+            .collect();
+        summaries.sort_by(|a, b| {
+            b.start_time_unix_nano
+                .cmp(&a.start_time_unix_nano)
+                .then_with(|| b.trace_id.cmp(&a.trace_id))
+        });
+        summaries
+            .into_iter()
+            .map(|summary| summary.trace_id)
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_filtered_trace_list_narrows_through_keys_and_index_without_losing_a_match() {
+        reset_observability_test_state();
+        let directory = tempfile::tempdir().expect("temp trace directory");
+        let _guard = attach_test_archive(directory.path());
+
+        let module = make_test_module(Arc::new(Engine::new()));
+        let span_storage = otel::get_span_storage().expect("span storage should exist");
+        span_storage.clear();
+        let session = |id| ("iii.session.id", id);
+        let function = |id| ("function_id", id);
+        span_storage.add_spans(vec![
+            // s1 on a child span only.
+            make_span("t-a", "r-a", None, "turn", "harness", 10, 90, "ok", vec![]),
+            make_span(
+                "t-a",
+                "c-a",
+                Some("r-a"),
+                "Call Tool",
+                "harness",
+                20,
+                30,
+                "ok",
+                vec![session("s1"), function("state::get")],
+            ),
+            // s2, with a failing child.
+            make_span(
+                "t-b",
+                "r-b",
+                None,
+                "turn",
+                "harness",
+                40,
+                95,
+                "ok",
+                vec![session("s2")],
+            ),
+            make_span(
+                "t-b",
+                "c-b",
+                Some("r-b"),
+                "database::query",
+                "database",
+                50,
+                60,
+                "error",
+                vec![session("s2")],
+            ),
+            // A background trace a user would hide.
+            make_span(
+                "t-c",
+                "r-c",
+                None,
+                "execute database::query",
+                "sentinel",
+                45,
+                46,
+                "ok",
+                vec![
+                    function("database::query"),
+                    ("faas.invoked_name", "database::query"),
+                ],
+            ),
+            // s1 only on an internal root; its visible child carries nothing.
+            make_span(
+                "t-int",
+                "r-int",
+                None,
+                "internal",
+                "iii",
+                5,
+                80,
+                "ok",
+                vec![function("engine::traces::list"), session("s1")],
+            ),
+            make_span(
+                "t-int",
+                "c-int",
+                Some("r-int"),
+                "visible child",
+                "harness",
+                6,
+                7,
+                "ok",
+                vec![],
+            ),
+            // Archived with s1 and the hidden function; its hot copy below
+            // carries neither.
+            make_span(
+                "t-g",
+                "r-g",
+                None,
+                "rewritten",
+                "harness",
+                70,
+                75,
+                "ok",
+                vec![session("s1"), function("database::query")],
+            ),
+            // An archived root whose only s1 span is still hot.
+            make_span("t-e", "r-e", None, "turn", "harness", 60, 99, "ok", vec![]),
+        ]);
+        flush_test_archive();
+        span_storage.clear();
+        // Hot only: in-progress snapshots never reach the archive until they
+        // close, like the turn a session is running right now.
+        let in_progress = |mut span: otel::StoredSpan| {
+            span.pending = true;
+            span.end_time_unix_nano = 0;
+            span
+        };
+        for span in [
+            make_span(
+                "t-d",
+                "r-d",
+                None,
+                "turn",
+                "harness",
+                100,
+                110,
+                "ok",
+                vec![session("s1")],
+            ),
+            make_span(
+                "t-e",
+                "c-e",
+                Some("r-e"),
+                "call tool",
+                "harness",
+                65,
+                66,
+                "ok",
+                vec![session("s1")],
+            ),
+            // A hot copy of an archived span replaces it, attributes included.
+            make_span(
+                "t-g",
+                "r-g",
+                None,
+                "rewritten",
+                "harness",
+                70,
+                75,
+                "ok",
+                vec![],
+            ),
+        ] {
+            span_storage.add_pending_span(in_progress(span));
+        }
+
+        let pairs = |pairs: &[(&str, &str)]| {
+            Some(
+                pairs
+                    .iter()
+                    .map(|(key, value)| vec![key.to_string(), value.to_string()])
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let session_scope = TracesListInput {
+            attributes: pairs(&[session("s1")]),
+            search_all_spans: Some(true),
+            ..Default::default()
+        };
+        let hide_database = pairs(&[
+            function("database::query"),
+            ("faas.invoked_name", "database::query"),
+        ]);
+        let cases = vec![
+            session_scope.clone(),
+            TracesListInput {
+                include_internal: Some(true),
+                ..session_scope.clone()
+            },
+            TracesListInput {
+                attributes: pairs(&[session("s1")]),
+                ..Default::default()
+            },
+            TracesListInput {
+                attributes: pairs(&[session("s1"), function("state::get")]),
+                search_all_spans: Some(true),
+                ..Default::default()
+            },
+            TracesListInput {
+                attributes: Some(vec![vec!["malformed".to_string()]]),
+                search_all_spans: Some(true),
+                ..Default::default()
+            },
+            TracesListInput {
+                attributes: Some(vec![]),
+                ..Default::default()
+            },
+            TracesListInput {
+                name: Some("CALL".to_string()),
+                search_all_spans: Some(true),
+                ..Default::default()
+            },
+            TracesListInput {
+                name: Some("turn".to_string()),
+                ..Default::default()
+            },
+            TracesListInput {
+                name: Some("visible".to_string()),
+                ..Default::default()
+            },
+            TracesListInput {
+                exclude_attributes: hide_database.clone(),
+                ..Default::default()
+            },
+            TracesListInput {
+                exclude_attributes: hide_database,
+                ..session_scope.clone()
+            },
+            TracesListInput {
+                service_name: Some("HARN".to_string()),
+                ..Default::default()
+            },
+            TracesListInput {
+                status: Some("error".to_string()),
+                ..Default::default()
+            },
+            TracesListInput {
+                name: Some("query".to_string()),
+                attributes: pairs(&[session("s2")]),
+                search_all_spans: Some(true),
+                ..Default::default()
+            },
+        ];
+        for case in cases {
+            let expected = exact_trace_list(&case);
+            let listed = module
+                .list_traces(TracesListInput {
+                    sort_order: Some("desc".to_string()),
+                    ..case.clone()
+                })
+                .await;
+            match listed {
+                FunctionResult::Success(value) => {
+                    let ids: Vec<String> = value
+                        .traces
+                        .iter()
+                        .map(|trace| trace.trace_id.clone())
+                        .collect();
+                    assert_eq!(ids, expected, "{case:?}");
+                    assert_eq!(value.total, expected.len(), "{case:?}");
+                }
+                _ => panic!("expected list_traces success for {case:?}"),
+            }
+        }
+
+        // Pin the cases the index decides, so an oracle drifting with the code
+        // under test cannot hide a lost match.
+        let ids = |result: FunctionResult<TracesListResult, ErrorBody>| match result {
+            FunctionResult::Success(value) => value
+                .traces
+                .iter()
+                .map(|trace| trace.trace_id.clone())
+                .collect::<Vec<_>>(),
+            _ => panic!("expected list_traces success"),
+        };
+        assert_eq!(
+            ids(module
+                .list_traces(TracesListInput {
+                    sort_order: Some("desc".to_string()),
+                    ..session_scope.clone()
+                })
+                .await),
+            vec!["t-d", "t-e", "t-a"],
+            "hot-only and child matches found; internal and rewritten spans not"
+        );
+        assert_eq!(
+            ids(module
+                .list_traces(TracesListInput {
+                    exclude_attributes: pairs(&[function("database::query")]),
+                    sort_order: Some("desc".to_string()),
+                    ..Default::default()
+                })
+                .await),
+            vec!["t-d", "t-g", "t-e", "t-b", "t-a", "t-int"],
+            "the hot copy of t-g no longer carries the hidden function"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_list_traces_root_page_widens_past_demoted_archived_children() {
         reset_observability_test_state();
         let directory = tempfile::tempdir().expect("temp trace directory");
@@ -9494,6 +10221,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: None,
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 

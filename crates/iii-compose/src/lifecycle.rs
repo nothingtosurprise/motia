@@ -1358,6 +1358,34 @@ pub struct ResolvedConfig {
     pub name: String,
 }
 
+fn resolve_config_value(
+    shipped: Option<serde_yaml::Value>,
+    fetched: Option<serde_yaml::Value>,
+    overrides: Option<serde_yaml::Value>,
+) -> Option<serde_yaml::Value> {
+    // An empty published mapping means the package has no public default. Do
+    // not inject it before the worker can register its own runtime default.
+    let mut value = shipped.filter(
+        |value| !matches!(value, serde_yaml::Value::Mapping(mapping) if mapping.is_empty()),
+    );
+
+    if let Some(fetched) = fetched {
+        value = Some(match value {
+            Some(base) => merge(base, fetched),
+            None => fetched,
+        });
+    }
+
+    if let Some(overrides) = overrides {
+        value = Some(match value {
+            Some(base) => merge(base, overrides),
+            None => overrides,
+        });
+    }
+
+    value
+}
+
 /// Resolves the identity and merges package defaults, current values, and overrides.
 /// Injects the execution value into the service without persisting it, while
 /// service failures propagate rather than silently starting with stale defaults.
@@ -1388,20 +1416,8 @@ async fn resolve_config(
     }
     // Lowest to highest: package defaults, current active value, compose override.
     // NOT_FOUND contributes nothing; transport/service failures still fail boot.
-    let mut value = shipped;
-    if let Some(fetched) = ctx.engine.fetch_config(&name).await? {
-        value = Some(match value {
-            Some(base) => merge(base, fetched),
-            None => fetched,
-        });
-    }
-
-    if let Some(overrides) = &container.config_override {
-        value = Some(match value {
-            Some(base) => merge(base, overrides.clone()),
-            None => overrides.clone(),
-        });
-    }
+    let fetched = ctx.engine.fetch_config(&name).await?;
+    let value = resolve_config_value(shipped, fetched, container.config_override.clone());
 
     // GET supplies the current active value, not a forced reload from disk.
     // Omitting an override keeps that value, including after a worker restart.
@@ -1511,6 +1527,66 @@ containers:
     fn an_unknown_target_is_rejected_before_anything_starts() {
         let err = plan_targets(&file(), Some("ghost")).unwrap_err();
         assert_eq!(err.code(), "UNKNOWN_CONTAINER");
+    }
+
+    fn yaml(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).expect("fixture should parse")
+    }
+
+    #[test]
+    fn an_empty_shipped_default_without_other_layers_is_not_injected() {
+        assert_eq!(resolve_config_value(Some(yaml("{}")), None, None), None);
+    }
+
+    #[test]
+    fn a_null_shipped_default_is_not_normalized() {
+        assert_eq!(
+            resolve_config_value(Some(serde_yaml::Value::Null), None, None),
+            Some(serde_yaml::Value::Null)
+        );
+    }
+    #[test]
+    fn an_empty_shipped_default_preserves_the_active_configuration() {
+        assert_eq!(
+            resolve_config_value(Some(yaml("{}")), Some(yaml("port: 5432")), None),
+            Some(yaml("port: 5432"))
+        );
+    }
+
+    #[test]
+    fn an_empty_shipped_default_preserves_the_compose_override() {
+        assert_eq!(
+            resolve_config_value(Some(yaml("{}")), None, Some(yaml("port: 6432"))),
+            Some(yaml("port: 6432"))
+        );
+    }
+
+    #[test]
+    fn a_real_shipped_default_preserves_layer_precedence() {
+        assert_eq!(
+            resolve_config_value(
+                Some(yaml("host: package\nport: 1111\n")),
+                Some(yaml("port: 2222\n")),
+                Some(yaml("port: 3333\n")),
+            ),
+            Some(yaml("host: package\nport: 3333\n"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_active_configuration_is_not_normalized() {
+        assert_eq!(
+            resolve_config_value(Some(yaml("{}")), Some(yaml("{}")), None),
+            Some(yaml("{}"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_override_is_not_normalized() {
+        assert_eq!(
+            resolve_config_value(Some(yaml("{}")), None, Some(yaml("{}"))),
+            Some(yaml("{}"))
+        );
     }
 
     #[test]
