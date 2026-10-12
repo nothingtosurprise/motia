@@ -31,6 +31,7 @@ use tokio::{
     time::Instant,
 };
 
+use crate::report;
 use crate::{
     config::{ComposeFile, RestartConfig},
     engine::EngineClient,
@@ -378,6 +379,10 @@ impl Project {
     /// observes the gaps between operations — a deliberate stop removes the
     /// child from the map before signalling it, and is never seen here.
     pub(crate) async fn reap_unexpected_exits(&self) {
+        crate::report::in_project_scope(&self.file_path, self.reap_scoped()).await
+    }
+
+    async fn reap_scoped(&self) {
         let dead: Vec<(String, ExitStatus)> = {
             let inner = self.inner.lock().await;
             inner
@@ -433,6 +438,10 @@ impl Project {
     /// worker is in a crash loop does not stop the daemon noticing anything
     /// else. The tick interval is the granularity of the backoff.
     pub(crate) async fn drive_restarts(&self) {
+        crate::report::in_project_scope(&self.file_path, self.drive_restarts_scoped()).await
+    }
+
+    async fn drive_restarts_scoped(&self) {
         let now = Instant::now();
         let due: Vec<String> = {
             let inner = self.inner.lock().await;
@@ -613,13 +622,16 @@ impl Project {
         {
             entry.status = ChildStatus::Restarting;
         }
+        // Emit while holding the existing project lock: down cancels retries
+        // under this same lock and must not be followed by a stale waiting row.
+        if let Some((next_attempt, delay)) = next_retry {
+            crate::report::retry_waiting(key, next_attempt, restart_config.max_attempts, delay);
+        }
         let snapshot = inner.state.clone();
         drop(inner);
         let _ = self.store.save(&snapshot);
 
-        if let Some((next_attempt, delay)) = next_retry {
-            crate::report::retry_waiting(key, next_attempt, restart_config.max_attempts, delay);
-        } else {
+        if next_retry.is_none() {
             self.report_gave_up(key, restart_config.max_attempts).await;
             self.cascade_failure(key, Self::exhausted_reason(restart_config.max_attempts))
                 .await;
@@ -833,12 +845,26 @@ impl Project {
         let shutdown = shutdown.or(self.shutdown.signal());
         let package_cache = self.package_cache();
         let vm_dir = self.vm_dir();
-        let mut inner = shutdown.run(self.inner.lock()).await?;
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
+        let mut inner = match shutdown.run(self.inner.lock()).await {
+            Some(inner) => inner,
+            None => {
+                report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+                return None;
+            }
+        };
         inner.restarts.operator_took_control(target);
         let Inner {
             children, state, ..
         } = &mut *inner;
-        let file = shutdown.run(self.file.read()).await?;
+        let file = match shutdown.run(self.file.read()).await {
+            Some(file) => file,
+            None => {
+                drop(inner);
+                report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+                return None;
+            }
+        };
 
         let ctx = LifecycleCtx {
             shutdown: &self.shutdown,
@@ -851,6 +877,7 @@ impl Project {
             logs: &self.logs,
             package_cache: &package_cache,
             vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
         };
 
         let result = lifecycle::up_until_shutdown(
@@ -866,6 +893,7 @@ impl Project {
         let snapshot = state.clone();
         drop(inner);
         let _ = self.store.save(&snapshot);
+        report::empty_env_warnings(&empty_env_diagnostics.snapshot());
         result
     }
 
@@ -881,6 +909,7 @@ impl Project {
     ) -> (Vec<OpResult>, OpResult, bool) {
         let package_cache = self.package_cache();
         let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
         let mut inner = self.inner.lock().await;
         inner.restarts.operator_took_control(None);
         let Inner {
@@ -903,6 +932,7 @@ impl Project {
             logs: &self.logs,
             package_cache: &package_cache,
             vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
         };
 
         let operation = crate::operation::active(&operation_id);
@@ -952,6 +982,7 @@ impl Project {
         drop(file);
         drop(inner);
         let _ = self.store.save(&snapshot);
+        report::empty_env_warnings(&empty_env_diagnostics.snapshot());
         (restarted, up, interrupted)
     }
 
@@ -969,6 +1000,7 @@ impl Project {
     ) -> (Vec<OpResult>, OpResult) {
         let package_cache = self.package_cache();
         let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
         let mut inner = self.inner.lock().await;
         inner.restarts.operator_took_control(None);
         let Inner {
@@ -990,6 +1022,7 @@ impl Project {
                 logs: &self.logs,
                 package_cache: &package_cache,
                 vm_dir: &vm_dir,
+                empty_env_diagnostics: &empty_env_diagnostics,
             };
             let mut stopped = Vec::with_capacity(removed.len());
             for (index, worker) in removed.iter().enumerate() {
@@ -1024,6 +1057,7 @@ impl Project {
             logs: &self.logs,
             package_cache: &package_cache,
             vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
         };
         let up = lifecycle::up(
             &ctx,
@@ -1038,6 +1072,7 @@ impl Project {
         drop(file);
         drop(inner);
         let _ = self.store.save(&snapshot);
+        report::empty_env_warnings(&empty_env_diagnostics.snapshot());
         (stopped, up)
     }
 
@@ -1065,6 +1100,7 @@ impl Project {
     ) -> OpResult {
         let package_cache = self.package_cache();
         let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
         let Inner {
             children, state, ..
         } = inner;
@@ -1080,9 +1116,10 @@ impl Project {
             logs: &self.logs,
             package_cache: &package_cache,
             vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
         };
 
-        if let Some((attempt, total_attempts)) = supervised_attempt {
+        let result = if let Some((attempt, total_attempts)) = supervised_attempt {
             lifecycle::restart_one_supervised(
                 &ctx,
                 children,
@@ -1095,12 +1132,15 @@ impl Project {
             .await
         } else {
             lifecycle::restart_one(&ctx, children, &mut state.containers, key, operation_id).await
-        }
+        };
+        report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+        result
     }
 
     pub async fn down(&self, target: Option<&str>, operation_id: String) -> OpResult {
         let package_cache = self.package_cache();
         let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
         let mut inner = self.inner.lock().await;
         inner.restarts.operator_took_control(target);
         let Inner {
@@ -1119,6 +1159,7 @@ impl Project {
             logs: &self.logs,
             package_cache: &package_cache,
             vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
         };
 
         let result =
@@ -1159,6 +1200,10 @@ impl Project {
                 ContainerStatus {
                     container: key.clone(),
                     state,
+                    version: file
+                        .containers
+                        .get(key)
+                        .and_then(|container| container.version_label()),
                     pid: record.filter(|_| running).map(|record| record.pid),
                     owned: inner
                         .as_ref()
@@ -1256,6 +1301,9 @@ impl Project {
 pub struct ContainerStatus {
     pub container: String,
     pub state: ChildStatus,
+    /// Locked package version, or `local` for a `path://` worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     /// Whether this daemon owns the process (started it and can stop it).

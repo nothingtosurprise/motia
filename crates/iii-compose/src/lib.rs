@@ -125,6 +125,18 @@ pub fn validate_project(
     manifest::validate_offline(&compose, &namespace)
 }
 
+static HOST_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Records the version of the binary hosting Compose. A managed engine runs
+/// this same binary, so startup shows this version beside the engine.
+pub fn set_host_version(version: impl Into<String>) {
+    let _ = HOST_VERSION.set(version.into());
+}
+
+pub(crate) fn host_version() -> Option<&'static str> {
+    HOST_VERSION.get().map(String::as_str)
+}
+
 /// Entry point behind `iii compose`. Returns the process exit code, matching
 /// the other `iii` subcommands.
 pub async fn run(cli: ComposeCli) -> i32 {
@@ -453,9 +465,12 @@ async fn serve(
     let shutdown = shutdown::ShutdownSignal::install()?;
 
     let mut start_project = start.then(|| InitialProject {
-        file,
+        file: file.clone(),
         frozen,
-        progress: report::StartupProgress::start(matches!(engine_mode, EngineMode::Managed { .. })),
+        progress: report::StartupProgress::start(
+            matches!(engine_mode, EngineMode::Managed { .. }),
+            &file,
+        ),
         shape: initial_file
             .as_ref()
             .map(telemetry::ProjectShape::of)

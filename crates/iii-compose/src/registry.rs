@@ -319,7 +319,13 @@ pub async fn resolve_package(
     version_range: &str,
 ) -> Result<ResolvedPackage> {
     let (registry, name) = split_reference(reference);
-    let worker = resolve(container, &registry, &name, version_range, host_targets()).await?;
+    #[cfg(test)]
+    let endpoint = TEST_REGISTRY
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| registry.clone());
+    #[cfg(not(test))]
+    let endpoint = registry.clone();
+    let worker = resolve(container, &endpoint, &name, version_range, host_targets()).await?;
     into_resolved_package(container, &registry, worker, host_target())
 }
 
@@ -520,6 +526,8 @@ impl From<&ResolvedPackage> for Node {
 
 pub(crate) async fn resolve_node(container: &str, reference: &str, range: &str) -> Result<Node> {
     let (registry, name) = split_reference(reference);
+    #[cfg(test)]
+    let registry = TEST_REGISTRY.try_with(Clone::clone).unwrap_or(registry);
     resolve(container, &registry, &name, range, host_targets())
         .await
         .map(Node::from)
@@ -533,6 +541,11 @@ pub struct Graph {
     pub edges: Vec<(String, String)>,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_REGISTRY: String;
+}
+
 /// Everything a worker needs, resolved in one request.
 ///
 /// The registry answers `/resolve` with the whole graph, not just the worker
@@ -541,6 +554,8 @@ pub struct Graph {
 /// different set, because each answer is computed on its own.
 pub async fn resolve_graph(container: &str, reference: &str, version_range: &str) -> Result<Graph> {
     let (registry, name) = split_reference(reference);
+    #[cfg(test)]
+    let registry = TEST_REGISTRY.try_with(Clone::clone).unwrap_or(registry);
     let response =
         resolve_response(container, &registry, &name, version_range, host_targets()).await?;
     Ok(Graph {
@@ -573,6 +588,7 @@ async fn install_binary(
     if cached && let Some(existing) = installed_binary(&install_dir) {
         return Ok((existing, InstallStatus::Cached));
     }
+    crate::report::download_version(container, &resolved.version);
     download_and_extract(container, artifact, &install_dir, &digest, lock).await?;
     let program =
         installed_binary(&install_dir).ok_or_else(|| ComposeError::PackageArtifactEmpty {
@@ -636,6 +652,7 @@ async fn install_bundle(
     if cached && install_dir.join(BUNDLE_MANIFEST).is_file() {
         return Ok((install_dir, InstallStatus::Cached));
     }
+    crate::report::download_version(container, &resolved.version);
     download_and_extract(container, artifact, &install_dir, &digest, lock).await?;
 
     if !install_dir.join(BUNDLE_MANIFEST).is_file() {

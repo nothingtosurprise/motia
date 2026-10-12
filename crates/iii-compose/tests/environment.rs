@@ -169,19 +169,20 @@ fn windows_case_equivalent_keys_obey_source_precedence() {
             assert_eq!(actual, [expected]);
         }
 
-        // An empty value in a later env file still overrides an earlier file;
-        // preservation applies only to an empty Compose `environment` value.
-        let file = project(
-            tmp.path(),
-            "containers:\n  api:\n    worker: path://./api\n    env_file: [base.env, last.env]\n",
-            &[
-                ("base.env", &format!("{first}=base\n")),
-                ("last.env", &format!("{alias}=\n")),
-            ],
-        );
-        let env = file.containers["api"].resolve_user_env("api").unwrap();
-        assert_eq!(env.len(), 1);
-        assert_eq!(env.values().next().unwrap(), "");
+        // Parsed-empty aliases must not erase an earlier nonempty file value.
+        for empty in ["", "\"\"", "''"] {
+            let file = project(
+                tmp.path(),
+                "containers:\n  api:\n    worker: path://./api\n    env_file: [base.env, last.env]\n",
+                &[
+                    ("base.env", &format!("{first}=base\n")),
+                    ("last.env", &format!("{alias}={empty}\n")),
+                ],
+            );
+            let env = file.containers["api"].resolve_user_env("api").unwrap();
+            assert_eq!(env.len(), 1, "{first}/{alias}: {empty:?}");
+            assert_eq!(env.values().next().unwrap(), "base");
+        }
     }
 }
 
@@ -228,11 +229,48 @@ fn nonempty_environment_values_still_override_env_files() {
             "containers:\n  api:\n    worker: path://./api\n    env_file: [base.env]\n    environment:\n      TOKEN: {value}\n"
         );
         let file = project(tmp.path(), &compose, &[("base.env", "TOKEN=fromfile\n")]);
-
         let env = file.containers["api"].resolve_user_env("api").unwrap();
-
         assert_eq!(env["TOKEN"], expected, "environment value: {value:?}");
     }
+}
+
+#[test]
+fn empty_env_file_values_fall_back_without_erasing_nonempty_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(
+        tmp.path(),
+        "containers:\n  api:\n    worker: path://./api\n    env_file: [base.env, later.env]\n",
+        &[
+            (
+                "base.env",
+                "KEEP=base\nQUOTED=base\nSINGLE=base\nSPACE=base\n",
+            ),
+            (
+                "later.env",
+                "KEEP=\nQUOTED=\"\"\nSINGLE=''\nSPACE=\" \"\nABSENT=\n# ignored\n\n",
+            ),
+        ],
+    );
+    let env = file.containers["api"].resolve_user_env("api").unwrap();
+    assert_eq!(env["KEEP"], "base");
+    assert_eq!(env["QUOTED"], "base");
+    assert_eq!(env["SINGLE"], "base");
+    assert_eq!(env["SPACE"], " ");
+    assert!(!env.contains_key("ABSENT"));
+}
+
+#[test]
+fn empty_env_file_entries_do_not_create_unset_variables() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(
+        tmp.path(),
+        "containers:\n  api:\n    worker: path://./api\n    env_file: [values.env]\n",
+        &[("values.env", "UNSET=\nEMPTY=\"\"\nSINGLE=''\n# comment\n\n")],
+    );
+    let env = file.containers["api"].resolve_user_env("api").unwrap();
+    assert!(!env.contains_key("UNSET"));
+    assert!(!env.contains_key("EMPTY"));
+    assert!(!env.contains_key("SINGLE"));
 }
 
 #[test]

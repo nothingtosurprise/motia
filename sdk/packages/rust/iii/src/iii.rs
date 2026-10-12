@@ -1,8 +1,323 @@
+// Main JSON outbound envelope: 16 MiB (16,777,216 bytes).
+const MAX_JSON_FRAME_BYTES: usize = 16 * 1024 * 1024;
+// Main JSON inbound frame/message: 64 MiB (67,108,864 bytes).
+const MAX_JSON_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(test)]
+mod json_size_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_rejection_preserves_result_fallback_and_following_messages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            let second = ws.next().await.unwrap().unwrap();
+            (first, second)
+        });
+        let (stream, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let (mut tx, _) = stream.split();
+        let sdk = IIIClient::new("ws://127.0.0.1:0");
+        let rejected =
+            IIIClient::prepare_envelope(&invocation("x".repeat(MAX_JSON_FRAME_BYTES))).unwrap_err();
+        assert_eq!(
+            rejected.invocation_error().unwrap().code,
+            "payload_too_large"
+        );
+        let mut queue = vec![
+            IIIClient::prepare_envelope(&Message::InvocationResult {
+                invocation_id: Uuid::nil(),
+                function_id: "f".into(),
+                result: Some(Value::String("x".repeat(MAX_JSON_FRAME_BYTES))),
+                error: None,
+                traceparent: None,
+                baggage: None,
+            })
+            .unwrap(),
+            IIIClient::prepare_envelope(&Message::Pong).unwrap(),
+        ];
+        sdk.flush_queue(&mut tx, &mut queue).await.unwrap();
+        assert!(queue.is_empty());
+        let (first, second) = server.await.unwrap();
+        let parsed: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["error"]["code"], "payload_too_large");
+        assert_eq!(second.to_text().unwrap(), "{\"type\":\"pong\"}");
+    }
+
+    #[tokio::test]
+    async fn local_argument_rejection_clears_pending_before_connection() {
+        let sdk = IIIClient::new("ws://127.0.0.1:0");
+        let error = sdk
+            .trigger(crate::protocol::TriggerRequest {
+                function_id: "size::echo".into(),
+                payload: Value::String("x".repeat(MAX_JSON_FRAME_BYTES)),
+                action: None,
+                timeout_ms: Some(100),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.invocation_error().unwrap().code, "payload_too_large");
+        assert!(sdk.inner.pending.lock_or_recover().is_empty());
+    }
+
+    struct TestTriggerHandler;
+
+    #[async_trait::async_trait]
+    impl TriggerHandler for TestTriggerHandler {
+        async fn register_trigger(&self, _: TriggerConfig) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn unregister_trigger(&self, _: TriggerConfig) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn register_test_type(sdk: &IIIClient, description: String) {
+        sdk.register_trigger_type(RegisterTriggerType::new(
+            "size::custom",
+            description,
+            TestTriggerHandler,
+        ));
+    }
+
+    #[test]
+    fn rejected_replacement_preserves_accepted_trigger_type_ownership() {
+        let sdk = IIIClient::new("ws://127.0.0.1:0");
+        sdk.inner.running.store(true, Ordering::SeqCst);
+        register_test_type(&sdk, "accepted".into());
+        let accepted_handler = sdk.inner.trigger_types.lock_or_recover()["size::custom"]
+            .handler
+            .clone();
+        let mut receiver = sdk.inner.receiver.lock_or_recover().take().unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Outbound::Message(_))));
+
+        register_test_type(&sdk, "x".repeat(MAX_JSON_FRAME_BYTES));
+
+        let types = sdk.inner.trigger_types.lock_or_recover();
+        let accepted = &types["size::custom"];
+        assert_eq!(accepted.message.description, "accepted");
+        assert!(Arc::ptr_eq(&accepted.handler, &accepted_handler));
+        assert!(receiver.try_recv().is_err());
+        drop(types);
+        register_test_type(&sdk, "following".into());
+        assert_eq!(
+            sdk.inner.trigger_types.lock_or_recover()["size::custom"]
+                .message
+                .description,
+            "following"
+        );
+        assert!(matches!(receiver.try_recv(), Ok(Outbound::Message(_))));
+    }
+
+    #[test]
+    fn rejected_function_handle_cannot_unregister_an_accepted_owner() {
+        let sdk = IIIClient::new("ws://127.0.0.1:0");
+        sdk.inner.running.store(true, Ordering::SeqCst);
+        let handler: RemoteFunctionHandlerWithMetadata =
+            Arc::new(|_, _| Box::pin(async { Ok(Value::Null) }));
+        sdk.register_function_inner(
+            RegisterFunctionMessage::with_id("size::handler".into()),
+            Some(handler.clone()),
+        );
+        let mut receiver = sdk.inner.receiver.lock_or_recover().take().unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Outbound::Message(_))));
+        let rejected = sdk.register_function_inner(
+            RegisterFunctionMessage::with_id("size::handler".into())
+                .with_description("x".repeat(MAX_JSON_FRAME_BYTES)),
+            None,
+        );
+        rejected.unregister();
+        let functions = sdk.inner.functions.lock_or_recover();
+        let accepted = &functions["size::handler"];
+        assert!(Arc::ptr_eq(accepted.handler.as_ref().unwrap(), &handler));
+        assert!(accepted.message.description.is_none());
+        assert!(receiver.try_recv().is_err());
+        drop(functions);
+        sdk.register_function_inner(
+            RegisterFunctionMessage::with_id("size::following".into()),
+            None,
+        );
+        assert!(matches!(receiver.try_recv(), Ok(Outbound::Message(_))));
+    }
+
+    #[test]
+    fn oversized_registrations_are_neither_retained_nor_enqueued() {
+        let sdk = IIIClient::new("ws://127.0.0.1:0");
+        sdk.inner.running.store(true, Ordering::SeqCst);
+        let rejected = sdk.register_function_inner(
+            RegisterFunctionMessage::with_id("size::rejected".into())
+                .with_description("x".repeat(MAX_JSON_FRAME_BYTES)),
+            None,
+        );
+        rejected.unregister();
+        register_test_type(&sdk, "x".repeat(MAX_JSON_FRAME_BYTES));
+        let error = sdk
+            .register_trigger(RegisterTriggerInput::new(
+                "size::custom",
+                "size::handler",
+                Value::String("x".repeat(MAX_JSON_FRAME_BYTES)),
+            ))
+            .err()
+            .expect("oversized trigger must fail");
+        assert_eq!(error.invocation_error().unwrap().code, "payload_too_large");
+        assert!(sdk.inner.functions.lock_or_recover().is_empty());
+        assert!(sdk.inner.trigger_types.lock_or_recover().is_empty());
+        assert!(sdk.inner.triggers.lock_or_recover().is_empty());
+        assert!(
+            sdk.inner
+                .receiver
+                .lock_or_recover()
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejected_trigger_type_preflight_does_not_acquire_ownership_mutex() {
+        let sdk = IIIClient::new("ws://127.0.0.1:0");
+        sdk.inner.running.store(true, Ordering::SeqCst);
+        register_test_type(&sdk, "accepted".into());
+        let rejected_sdk = sdk.clone();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let owned = sdk.inner.trigger_types.lock_or_recover();
+        let thread = std::thread::spawn(move || {
+            register_test_type(&rejected_sdk, "x".repeat(MAX_JSON_FRAME_BYTES));
+            finished_tx.send(()).unwrap();
+        });
+        // Holding the mutex makes the old insertion-before-validation path
+        // deterministically unable to finish; this is a timeout, not a sleep.
+        let completed_without_ownership = finished_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        assert_eq!(owned["size::custom"].message.description, "accepted");
+        drop(owned);
+        thread.join().unwrap();
+        assert!(
+            completed_without_ownership,
+            "rejected registration touched ownership"
+        );
+    }
+
+    #[test]
+    fn delayed_send_rejection_cannot_remove_a_newer_accepted_generation() {
+        let sdk = IIIClient::new("ws://127.0.0.1:0");
+        sdk.inner.running.store(true, Ordering::SeqCst);
+        register_test_type(&sdk, "previous".into());
+        let rejected_message = sdk.inner.trigger_types.lock_or_recover()["size::custom"]
+            .message
+            .clone();
+        let mut rejected_message = rejected_message.to_message();
+        if let Message::RegisterTriggerType { description, .. } = &mut rejected_message {
+            *description = "x".repeat(MAX_JSON_FRAME_BYTES);
+        }
+        let rejected_sdk = sdk.clone();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            proceed_rx.recv().unwrap();
+            rejected_sdk.send_message(rejected_message).unwrap_err()
+        });
+        // Order the same shared-helper rejection after a newer accepted owner,
+        // exactly the harmful rollback interleaving, without timing guesses.
+        register_test_type(&sdk, "newer".into());
+        let newer_handler = sdk.inner.trigger_types.lock_or_recover()["size::custom"]
+            .handler
+            .clone();
+        proceed_tx.send(()).unwrap();
+        let error = thread.join().unwrap();
+        assert_eq!(error.invocation_error().unwrap().code, "payload_too_large");
+        let types = sdk.inner.trigger_types.lock_or_recover();
+        assert_eq!(types["size::custom"].message.description, "newer");
+        assert!(Arc::ptr_eq(&types["size::custom"].handler, &newer_handler));
+        drop(types);
+        let mut receiver = sdk.inner.receiver.lock_or_recover().take().unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Outbound::Message(_))));
+        assert!(matches!(receiver.try_recv(), Ok(Outbound::Message(_))));
+        assert!(receiver.try_recv().is_err());
+        sdk.send_message(Message::Pong).unwrap();
+        match receiver.try_recv().unwrap() {
+            Outbound::Message(envelope) => {
+                assert_eq!(envelope.payload.as_str(), "{\"type\":\"pong\"}");
+            }
+            Outbound::Shutdown => panic!("expected pong"),
+        }
+    }
+
+    fn invocation(data: String) -> Message {
+        Message::InvokeFunction {
+            invocation_id: Some(Uuid::nil()),
+            function_id: "size::echo".into(),
+            data: Value::String(data),
+            traceparent: None,
+            baggage: None,
+            action: None,
+            metadata: None,
+            namespace: None,
+        }
+    }
+
+    #[test]
+    fn complete_utf8_envelope_has_inclusive_boundary() {
+        let overhead = serde_json::to_string(&invocation(String::new()))
+            .unwrap()
+            .len();
+        for size in [
+            MAX_JSON_FRAME_BYTES - 1,
+            MAX_JSON_FRAME_BYTES,
+            MAX_JSON_FRAME_BYTES + 1,
+        ] {
+            let message = invocation("x".repeat(size - overhead));
+            let result = IIIClient::prepare_envelope(&message);
+            if size <= MAX_JSON_FRAME_BYTES {
+                assert_eq!(result.unwrap().payload.len(), size);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.invocation_error().unwrap().code, "payload_too_large");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_and_escapes_use_serialized_bytes() {
+        let input = "😀é\n\"\\".repeat(1_700_000);
+        assert!(input.chars().count() < MAX_JSON_FRAME_BYTES);
+        assert!(IIIClient::prepare_envelope(&invocation(input)).is_err());
+    }
+
+    #[test]
+    fn result_fallback_preserves_correlation_and_discards_large_context() {
+        let message = Message::InvocationResult {
+            invocation_id: Uuid::nil(),
+            function_id: "size::echo".into(),
+            result: Some(Value::String("x".repeat(MAX_JSON_FRAME_BYTES))),
+            error: None,
+            traceparent: None,
+            baggage: Some("secret".repeat(1000)),
+        };
+        let payload = IIIClient::prepare_envelope(&message).unwrap().payload;
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["invocation_id"], Uuid::nil().to_string());
+        assert_eq!(parsed["error"]["code"], "payload_too_large");
+        assert!(parsed.get("result").is_none());
+        assert!(!payload.contains("secret"));
+    }
+
+    #[test]
+    fn explicit_receive_capacity_is_bounded() {
+        let config = IIIClient::receive_config();
+        assert_eq!(config.max_frame_size, Some(67_108_864));
+        assert_eq!(config.max_message_size, Some(67_108_864));
+    }
+}
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -26,7 +341,12 @@ use tokio::{
     sync::{Notify, mpsc, oneshot},
     time::{Instant, interval, sleep, sleep_until},
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+#[cfg(test)]
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{Message as WsMessage, Utf8Bytes, protocol::WebSocketConfig},
+};
 use uuid::Uuid;
 
 const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -417,8 +737,9 @@ pub(crate) fn call_namespace(
 
 /// The namespace in which one function invocation resolves.
 ///
-/// An explicit namespace always wins. Without one, engine-owned builtins stay
-/// in `default`; all other calls inherit the worker's namespace.
+/// An explicit namespace always wins. Without one, engine-owned builtins
+/// (`engine::*` and `configuration::*`) stay in `default`; all other calls
+/// inherit the worker's namespace.
 pub(crate) fn invocation_namespace(
     explicit: Option<String>,
     worker: Option<String>,
@@ -428,7 +749,9 @@ pub(crate) fn invocation_namespace(
     let is_implicit = explicit.is_none();
     let namespace = call_namespace(explicit, worker, source)?;
 
-    if is_implicit && function_id.starts_with("engine::") {
+    if is_implicit
+        && (function_id.starts_with("engine::") || function_id.starts_with("configuration::"))
+    {
         Ok(Some("default".to_string()))
     } else {
         Ok(namespace)
@@ -504,9 +827,76 @@ fn parse_cargo_package_name(content: &str) -> Option<String> {
     None
 }
 
-#[allow(clippy::large_enum_variant)]
+// Bounds reservations for deliberately retained String spare capacity,
+// not payload volume, allocator overhead, or physical heap/RSS.
+const MAX_OUTBOUND_SPARE_BYTES: usize = 128 * 1024;
+
+#[derive(Debug)]
+struct SpareCapacityLease {
+    used: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl SpareCapacityLease {
+    fn reserve(used: &Arc<AtomicUsize>, bytes: usize) -> Option<Self> {
+        if bytes == 0 || bytes > MAX_OUTBOUND_SPARE_BYTES {
+            return None;
+        }
+        let mut current = used.load(Ordering::Relaxed);
+        loop {
+            let next = current.checked_add(bytes)?;
+            if next > MAX_OUTBOUND_SPARE_BYTES {
+                return None;
+            }
+            match used.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        Some(Self {
+            used: Arc::clone(used),
+            bytes,
+        })
+    }
+}
+
+impl Drop for SpareCapacityLease {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct PreparedEnvelope {
+    payload: Utf8Bytes,
+    registration_key: Option<String>,
+    // The payload is dropped before its lease; send_ws borrows the envelope
+    // throughout its shared-byte clone and network await.
+    _spare_capacity: Option<SpareCapacityLease>,
+}
+
+impl PreparedEnvelope {
+    fn from_json(
+        mut payload: String,
+        registration_key: Option<String>,
+        budget: Option<&Arc<AtomicUsize>>,
+    ) -> Self {
+        let spare = payload.capacity() - payload.len();
+        let lease = budget.and_then(|used| SpareCapacityLease::reserve(used, spare));
+        if spare != 0 && lease.is_none() {
+            // Compact disconnected/control messages and exhausted budgets.
+            payload.shrink_to_fit();
+        }
+        Self {
+            payload: payload.into(),
+            registration_key,
+            _spare_capacity: lease,
+        }
+    }
+}
+
 enum Outbound {
-    Message(Message),
+    Message(PreparedEnvelope),
     Shutdown,
 }
 
@@ -916,6 +1306,7 @@ impl Default for ConnTimings {
 struct IIIInner {
     address: String,
     outbound: mpsc::UnboundedSender<Outbound>,
+    spare_capacity_budget: Arc<AtomicUsize>,
     receiver: Mutex<Option<mpsc::UnboundedReceiver<Outbound>>>,
     running: AtomicBool,
     started: AtomicBool,
@@ -978,6 +1369,7 @@ impl IIIClient {
         let inner = IIIInner {
             address: address.into(),
             outbound: tx,
+            spare_capacity_budget: Arc::new(AtomicUsize::new(0)),
             receiver: Mutex::new(Some(rx)),
             running: AtomicBool::new(false),
             started: AtomicBool::new(false),
@@ -1208,10 +1600,18 @@ impl IIIClient {
         if id.trim().is_empty() {
             panic!("id is required");
         }
-        let data = RemoteFunctionData {
-            message: message.clone(),
-            handler,
+        let envelope = match Self::prepare_envelope(&message.to_message()) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                tracing::warn!(error = %error, "Function registration rejected locally");
+                // A rejected handle must not unregister a previous owner of this ID.
+                return FunctionRef {
+                    id,
+                    unregister_fn: Arc::new(|| {}),
+                };
+            }
         };
+        let data = RemoteFunctionData { message, handler };
         let mut funcs = self.inner.functions.lock_or_recover();
         match funcs.entry(id.clone()) {
             std::collections::hash_map::Entry::Occupied(_) => {
@@ -1222,7 +1622,7 @@ impl IIIClient {
             }
         }
         drop(funcs);
-        let _ = self.send_message(message.to_message());
+        let _ = self.send_prepared(envelope);
 
         let iii = self.clone();
         let unregister_id = id.clone();
@@ -1372,15 +1772,24 @@ impl IIIClient {
 
         let trigger_type_id = message.id.clone();
 
-        self.inner.trigger_types.lock_or_recover().insert(
-            message.id.clone(),
-            RemoteTriggerTypeData {
-                message: message.clone(),
-                handler: Arc::new(trigger_type.handler),
-            },
-        );
+        // Validate before touching ownership: rollback by ID could remove a
+        // previously accepted handler, including a newer concurrent generation.
+        match Self::prepare_envelope(&message.to_message()) {
+            Ok(envelope) => {
+                self.inner.trigger_types.lock_or_recover().insert(
+                    message.id.clone(),
+                    RemoteTriggerTypeData {
+                        message,
+                        handler: Arc::new(trigger_type.handler),
+                    },
+                );
 
-        let _ = self.send_message(message.to_message());
+                let _ = self.send_prepared(envelope);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Trigger type registration rejected locally")
+            }
+        }
 
         TriggerTypeRef {
             iii: self.clone(),
@@ -1454,11 +1863,11 @@ impl IIIClient {
             trigger_namespace: input.trigger_namespace,
         };
 
+        self.send_message(message.to_message())?;
         self.inner
             .triggers
             .lock_or_recover()
             .insert(message.id.clone(), message.clone());
-        let _ = self.send_message(message.to_message());
 
         let iii = self.clone();
         let trigger_type = message.trigger_type.clone();
@@ -1570,7 +1979,7 @@ impl IIIClient {
             .lock_or_recover()
             .insert(invocation_id, tx);
 
-        self.send_message(Message::InvokeFunction {
+        if let Err(error) = self.send_message(Message::InvokeFunction {
             invocation_id: Some(invocation_id),
             function_id: req.function_id,
             data: req.payload,
@@ -1579,7 +1988,10 @@ impl IIIClient {
             action: req.action,
             metadata,
             namespace,
-        })?;
+        }) {
+            self.inner.pending.lock_or_recover().remove(&invocation_id);
+            return Err(error);
+        }
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
@@ -1641,19 +2053,100 @@ impl IIIClient {
         }
     }
 
+    // A single-frame JSON envelope must fit Axum's inclusive 16 MiB frame limit.
+    fn receive_config() -> WebSocketConfig {
+        WebSocketConfig::default()
+            .max_frame_size(Some(MAX_JSON_MESSAGE_BYTES))
+            .max_message_size(Some(MAX_JSON_MESSAGE_BYTES))
+    }
+
+    fn prepare_outbound(&self, message: &Message) -> Result<PreparedEnvelope, Error> {
+        let budget = if matches!(
+            message,
+            Message::InvokeFunction { .. } | Message::InvocationResult { .. }
+        ) && self.get_connection_state() == IIIConnectionState::Connected
+        {
+            Some(&self.inner.spare_capacity_budget)
+        } else {
+            None
+        };
+        Self::prepare_envelope_with_budget(message, budget)
+    }
+
+    fn prepare_envelope(message: &Message) -> Result<PreparedEnvelope, Error> {
+        Self::prepare_envelope_with_budget(message, None)
+    }
+
+    fn prepare_envelope_with_budget(
+        message: &Message,
+        budget: Option<&Arc<AtomicUsize>>,
+    ) -> Result<PreparedEnvelope, Error> {
+        let payload = serde_json::to_string(message)?;
+        let size = payload.len();
+        if size <= MAX_JSON_FRAME_BYTES {
+            return Ok(PreparedEnvelope::from_json(
+                payload,
+                Self::registration_key(message),
+                budget,
+            ));
+        }
+        let error_message = format!(
+            "Serialized JSON envelope is {size} bytes; limit is {MAX_JSON_FRAME_BYTES} bytes. Use channels for large data."
+        );
+        if let Message::InvocationResult {
+            invocation_id,
+            function_id,
+            ..
+        } = message
+        {
+            let fallback = Message::InvocationResult {
+                invocation_id: *invocation_id,
+                function_id: function_id.clone(),
+                result: None,
+                error: Some(ErrorBody {
+                    code: "payload_too_large".to_string(),
+                    message: error_message.clone(),
+                    stacktrace: None,
+                }),
+                traceparent: None,
+                baggage: None,
+            };
+            let payload = serde_json::to_string(&fallback)?;
+            if payload.len() <= MAX_JSON_FRAME_BYTES {
+                return Ok(PreparedEnvelope::from_json(payload, None, None));
+            }
+        }
+        Err(Error::Remote {
+            code: "payload_too_large".to_string(),
+            message: error_message,
+            stacktrace: None,
+        })
+    }
+
     fn send_message(&self, message: Message) -> Result<(), Error> {
+        let envelope = match self.prepare_outbound(&message) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                tracing::warn!(error = %error, "JSON envelope rejected locally");
+                return Err(error);
+            }
+        };
+        self.send_prepared(envelope)
+    }
+
+    fn send_prepared(&self, envelope: PreparedEnvelope) -> Result<(), Error> {
         if !self.inner.running.load(Ordering::SeqCst) {
             return Ok(());
         }
 
         self.inner
             .outbound
-            .send(Outbound::Message(message))
+            .send(Outbound::Message(envelope))
             .map_err(|_| Error::NotConnected)
     }
 
     async fn run_connection(&self, mut rx: mpsc::UnboundedReceiver<Outbound>) {
-        let mut queue: Vec<Message> = Vec::new();
+        let mut queue: Vec<PreparedEnvelope> = Vec::new();
         let mut has_connected_before = false;
 
         while self.inner.running.load(Ordering::SeqCst) {
@@ -1688,9 +2181,14 @@ impl IIIClient {
                             request.headers_mut().insert(name, val);
                         }
                     }
-                    connect_async(request).await
+                    connect_async_with_config(request, Some(Self::receive_config()), false).await
                 } else {
-                    connect_async(&self.inner.address).await
+                    connect_async_with_config(
+                        &self.inner.address,
+                        Some(Self::receive_config()),
+                        false,
+                    )
+                    .await
                 }
             })
             .await;
@@ -1712,16 +2210,15 @@ impl IIIClient {
                     let previous_worker_id = self.inner.worker_id.lock_or_recover().clone();
                     if let Some(previous_worker_id) = previous_worker_id {
                         let reattach_token = self.inner.reattach_token.lock_or_recover().clone();
-                        if let Err(err) = self
-                            .send_ws(
-                                &mut ws_tx,
-                                &Message::Reattach {
-                                    previous_worker_id,
-                                    reattach_token,
-                                },
-                            )
-                            .await
-                        {
+                        let reattach = Self::prepare_envelope(&Message::Reattach {
+                            previous_worker_id,
+                            reattach_token,
+                        });
+                        let send_result = match reattach {
+                            Ok(envelope) => self.send_ws(&mut ws_tx, &envelope).await,
+                            Err(error) => Err(error),
+                        };
+                        if let Err(err) = send_result {
                             tracing::warn!(error = %err, "failed to send reattach; reconnecting");
                             sleep(t.retry_delay).await;
                             continue;
@@ -1737,8 +2234,10 @@ impl IIIClient {
                     // threads before the WS handshake completed: each call
                     // both inserts into the in-memory map (replayed via
                     // `collect_registrations`) AND queues into `outbound`.
-                    let snapshot_ids: HashSet<String> =
-                        queue.iter().filter_map(Self::registration_key).collect();
+                    let snapshot_ids: HashSet<String> = queue
+                        .iter()
+                        .filter_map(|message| message.registration_key.clone())
+                        .collect();
 
                     if let Err(err) = self.flush_queue(&mut ws_tx, &mut queue).await {
                         tracing::warn!(error = %err, "failed to flush queue");
@@ -1863,7 +2362,7 @@ impl IIIClient {
         }
     }
 
-    fn collect_registrations(&self) -> Vec<Message> {
+    fn collect_registrations(&self) -> Vec<PreparedEnvelope> {
         let mut messages = Vec::new();
 
         for trigger_type in self.inner.trigger_types.lock_or_recover().values() {
@@ -1879,6 +2378,15 @@ impl IIIClient {
         }
 
         messages
+            .into_iter()
+            .filter_map(|message| match Self::prepare_envelope(&message) {
+                Ok(envelope) => Some(envelope),
+                Err(error) => {
+                    tracing::warn!(error = %error, "registration replay rejected locally");
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Returns a stable identity key for a registration message, or `None`
@@ -1905,14 +2413,16 @@ impl IIIClient {
     /// drain, the caller should then stop the connection loop.
     fn drain_pre_connect_duplicates(
         rx: &mut mpsc::UnboundedReceiver<Outbound>,
-        queue: &mut Vec<Message>,
+        queue: &mut Vec<PreparedEnvelope>,
         snapshot_ids: &HashSet<String>,
     ) -> bool {
         loop {
             match rx.try_recv() {
                 Ok(Outbound::Message(msg)) => {
-                    let is_dup = Self::registration_key(&msg)
-                        .map(|k| snapshot_ids.contains(&k))
+                    let is_dup = msg
+                        .registration_key
+                        .as_ref()
+                        .map(|k| snapshot_ids.contains(k))
                         .unwrap_or(false);
                     if is_dup {
                         continue;
@@ -1925,19 +2435,19 @@ impl IIIClient {
         }
     }
 
-    fn dedupe_registrations(queue: &mut Vec<Message>) {
+    fn dedupe_registrations(queue: &mut Vec<PreparedEnvelope>) {
         let mut seen = HashSet::new();
         let mut deduped_rev = Vec::with_capacity(queue.len());
 
-        for message in queue.iter().rev() {
-            match Self::registration_key(message) {
+        for message in std::mem::take(queue).into_iter().rev() {
+            match &message.registration_key {
                 Some(key) => {
-                    if seen.insert(key) {
-                        deduped_rev.push(message.clone());
+                    if seen.insert(key.clone()) {
+                        deduped_rev.push(message);
                     }
                 }
                 None => {
-                    deduped_rev.push(message.clone());
+                    deduped_rev.push(message);
                 }
             }
         }
@@ -1946,7 +2456,11 @@ impl IIIClient {
         *queue = deduped_rev;
     }
 
-    async fn flush_queue(&self, ws_tx: &mut WsTx, queue: &mut Vec<Message>) -> Result<(), Error> {
+    async fn flush_queue(
+        &self,
+        ws_tx: &mut WsTx,
+        queue: &mut Vec<PreparedEnvelope>,
+    ) -> Result<(), Error> {
         let mut drained = Vec::new();
         std::mem::swap(queue, &mut drained);
 
@@ -1962,16 +2476,18 @@ impl IIIClient {
         Ok(())
     }
 
-    async fn send_ws(&self, ws_tx: &mut WsTx, message: &Message) -> Result<(), Error> {
-        let payload = serde_json::to_string(message)?;
+    async fn send_ws(&self, ws_tx: &mut WsTx, message: &PreparedEnvelope) -> Result<(), Error> {
         // Bound the send: on a blackholed peer with a full TCP send window,
         // send().await can block indefinitely — and since callers await this
         // inside select! handlers, an unbounded send wedges the entire
         // connection loop (idle detection included). A send that can't
         // complete within the idle window is a dead link; reconnect.
         let t = *self.inner.timings.lock_or_recover();
-        match tokio::time::timeout(t.idle_timeout, ws_tx.send(WsMessage::Text(payload.into())))
-            .await
+        match tokio::time::timeout(
+            t.idle_timeout,
+            ws_tx.send(WsMessage::Text(message.payload.clone())),
+        )
+        .await
         {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => Err(err.into()),
@@ -2221,16 +2737,16 @@ impl IIIClient {
     ) {
         tracing::debug!(function_id = %function_id, traceparent = ?traceparent, baggage = ?baggage, "Invoking function");
 
-        let func_data = self
+        // Preserve HTTP-only registrations without copying their descriptors.
+        let function_handler = self
             .inner
             .functions
             .lock_or_recover()
             .get(&function_id)
-            .cloned();
-        let handler = func_data.as_ref().and_then(|d| d.handler.clone());
+            .map(|function| function.handler.clone());
 
-        let Some(handler) = handler else {
-            let (code, message) = match &func_data {
+        let Some(Some(handler)) = function_handler else {
+            let (code, message) = match function_handler {
                 Some(_) => (
                     "function_not_invokable".to_string(),
                     "Function is HTTP-invoked and cannot be invoked locally".to_string(),
@@ -2307,7 +2823,7 @@ impl IIIClient {
                 use iii_helpers::observability::opentelemetry::trace::TraceContextExt;
                 use iii_helpers::observability::redact_and_truncate;
                 let span = otel_cx.span();
-                if span.span_context().is_valid() {
+                if span.is_recording() {
                     let (input_json, truncated) = redact_and_truncate(&data, payload_max_bytes);
                     span.add_event(
                         "iii.invocation.input",
@@ -2329,7 +2845,7 @@ impl IIIClient {
                 use iii_helpers::observability::opentelemetry::trace::TraceContextExt;
                 use iii_helpers::observability::redact_and_truncate;
                 let span = otel_cx.span();
-                if span.span_context().is_valid() {
+                if span.is_recording() {
                     let (output_json, truncated, ok) = match &result {
                         Ok(value) => {
                             let (j, t) = redact_and_truncate(value, payload_max_bytes);
@@ -3088,17 +3604,13 @@ mod tests {
         let mut rx = iii.inner.receiver.lock().unwrap().take().expect("receiver");
         let sent = rx.try_recv().expect("sent invoke");
         match sent {
-            Outbound::Message(Message::InvokeFunction {
-                function_id,
-                data,
-                metadata,
-                action,
-                ..
-            }) => {
-                assert_eq!(function_id, "svc::work");
-                assert_eq!(data, json!({ "x": 1 }));
-                assert_eq!(metadata, Some(json!({ "tenant": "acme" })));
-                assert!(matches!(action, Some(TriggerAction::Void)));
+            Outbound::Message(envelope) => {
+                let wire: Value = serde_json::from_str(envelope.payload.as_str()).unwrap();
+                assert_eq!(wire["type"], "invokefunction");
+                assert_eq!(wire["function_id"], "svc::work");
+                assert_eq!(wire["data"], json!({ "x": 1 }));
+                assert_eq!(wire["metadata"], json!({ "tenant": "acme" }));
+                assert_eq!(wire["action"]["type"], "void");
             }
             _ => panic!("expected InvokeFunction"),
         }
@@ -3124,13 +3636,11 @@ mod tests {
         let mut rx = iii.inner.receiver.lock().unwrap().take().expect("receiver");
         let sent = rx.try_recv().expect("sent invoke");
         match sent {
-            Outbound::Message(Message::InvokeFunction {
-                function_id,
-                metadata,
-                ..
-            }) => {
-                assert_eq!(function_id, "svc::work");
-                assert!(metadata.is_none());
+            Outbound::Message(envelope) => {
+                let wire: Value = serde_json::from_str(envelope.payload.as_str()).unwrap();
+                assert_eq!(wire["type"], "invokefunction");
+                assert_eq!(wire["function_id"], "svc::work");
+                assert!(wire.get("metadata").is_none());
             }
             _ => panic!("expected invoke"),
         }
@@ -3447,16 +3957,30 @@ mod tests {
     async fn drain_pre_connect_duplicates_drops_only_known_register_ids() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Outbound>();
 
-        tx.send(Outbound::Message(make_register_function("dup-fn")))
-            .unwrap();
-        tx.send(Outbound::Message(make_invoke("some::fn"))).unwrap();
-        tx.send(Outbound::Message(make_register_function("new-fn")))
-            .unwrap();
-        tx.send(Outbound::Message(Message::Pong)).unwrap();
-        tx.send(Outbound::Message(make_register_trigger("dup-trig")))
-            .unwrap();
-        tx.send(Outbound::Message(make_register_trigger("new-trig")))
-            .unwrap();
+        tx.send(Outbound::Message(
+            IIIClient::prepare_envelope(&make_register_function("dup-fn")).unwrap(),
+        ))
+        .unwrap();
+        tx.send(Outbound::Message(
+            IIIClient::prepare_envelope(&make_invoke("some::fn")).unwrap(),
+        ))
+        .unwrap();
+        tx.send(Outbound::Message(
+            IIIClient::prepare_envelope(&make_register_function("new-fn")).unwrap(),
+        ))
+        .unwrap();
+        tx.send(Outbound::Message(
+            IIIClient::prepare_envelope(&Message::Pong).unwrap(),
+        ))
+        .unwrap();
+        tx.send(Outbound::Message(
+            IIIClient::prepare_envelope(&make_register_trigger("dup-trig")).unwrap(),
+        ))
+        .unwrap();
+        tx.send(Outbound::Message(
+            IIIClient::prepare_envelope(&make_register_trigger("new-trig")).unwrap(),
+        ))
+        .unwrap();
 
         let snapshot_ids: HashSet<String> = [
             "function:dup-fn".to_string(),
@@ -3465,12 +3989,14 @@ mod tests {
         .into_iter()
         .collect();
 
-        let mut queue: Vec<Message> = Vec::new();
+        let mut queue: Vec<PreparedEnvelope> = Vec::new();
         let shutdown = IIIClient::drain_pre_connect_duplicates(&mut rx, &mut queue, &snapshot_ids);
 
         assert!(!shutdown);
-        let kept_keys: Vec<Option<String>> =
-            queue.iter().map(IIIClient::registration_key).collect();
+        let kept_keys: Vec<Option<String>> = queue
+            .iter()
+            .map(|message| message.registration_key.clone())
+            .collect();
         assert_eq!(
             kept_keys,
             vec![
@@ -3487,14 +4013,18 @@ mod tests {
     async fn drain_pre_connect_duplicates_signals_shutdown() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Outbound>();
 
-        tx.send(Outbound::Message(make_register_function("a")))
-            .unwrap();
+        tx.send(Outbound::Message(
+            IIIClient::prepare_envelope(&make_register_function("a")).unwrap(),
+        ))
+        .unwrap();
         tx.send(Outbound::Shutdown).unwrap();
-        tx.send(Outbound::Message(make_register_function("b")))
-            .unwrap();
+        tx.send(Outbound::Message(
+            IIIClient::prepare_envelope(&make_register_function("b")).unwrap(),
+        ))
+        .unwrap();
 
         let snapshot_ids: HashSet<String> = ["function:a".to_string()].into_iter().collect();
-        let mut queue: Vec<Message> = Vec::new();
+        let mut queue: Vec<PreparedEnvelope> = Vec::new();
         let shutdown = IIIClient::drain_pre_connect_duplicates(&mut rx, &mut queue, &snapshot_ids);
 
         assert!(shutdown, "expected shutdown signal to be reported");
@@ -3508,7 +4038,7 @@ mod tests {
     async fn drain_pre_connect_duplicates_returns_false_on_empty_channel() {
         let (_tx, mut rx) = mpsc::unbounded_channel::<Outbound>();
         let snapshot_ids: HashSet<String> = HashSet::new();
-        let mut queue: Vec<Message> = Vec::new();
+        let mut queue: Vec<PreparedEnvelope> = Vec::new();
 
         let shutdown = IIIClient::drain_pre_connect_duplicates(&mut rx, &mut queue, &snapshot_ids);
 
@@ -3606,13 +4136,11 @@ mod tests {
         let mut rx = iii.inner.receiver.lock().unwrap().take().expect("receiver");
         let sent = rx.try_recv().expect("sent invoke");
         match sent {
-            Outbound::Message(msg @ Message::InvokeFunction { .. }) => {
-                let Message::InvokeFunction { namespace, .. } = &msg else {
-                    unreachable!()
-                };
-                assert_eq!(namespace.as_deref(), Some("orders"));
-                // And it actually reaches the wire.
-                let wire = serde_json::to_string(&msg).unwrap();
+            Outbound::Message(envelope) => {
+                let wire = envelope.payload.as_str();
+                let parsed: Value = serde_json::from_str(wire).unwrap();
+                assert_eq!(parsed["type"], "invokefunction");
+                assert_eq!(parsed["namespace"], "orders");
                 assert!(wire.contains(r#""namespace":"orders""#), "wire: {wire}");
             }
             _ => panic!("expected InvokeFunction"),
@@ -3639,12 +4167,11 @@ mod tests {
         let mut rx = iii.inner.receiver.lock().unwrap().take().expect("receiver");
         let sent = rx.try_recv().expect("sent invoke");
         match sent {
-            Outbound::Message(msg @ Message::InvokeFunction { .. }) => {
-                let Message::InvokeFunction { namespace, .. } = &msg else {
-                    unreachable!()
-                };
-                assert!(namespace.is_none());
-                let wire = serde_json::to_string(&msg).unwrap();
+            Outbound::Message(envelope) => {
+                let wire = envelope.payload.as_str();
+                let parsed: Value = serde_json::from_str(wire).unwrap();
+                assert_eq!(parsed["type"], "invokefunction");
+                assert!(parsed.get("namespace").is_none());
                 assert!(!wire.contains("namespace"), "wire: {wire}");
             }
             _ => panic!("expected InvokeFunction"),
