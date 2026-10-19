@@ -5,6 +5,280 @@ owner: "devrel"
 type: "reference"
 ---
 
+<Update label="0.24.6" description="October 2026">
+  ## Compose worker cleanup and process management
+
+  - On Linux and macOS, Compose starts a reaper process that stops its workers and their process
+    groups if Compose crashes, receives `SIGKILL`, or exits on a second shutdown signal. The
+    reaper sends `SIGTERM`, waits up to 10 seconds, then sends `SIGKILL`. Windows behavior is
+    unchanged.
+  - Workers left running by a Compose process that is gone are stopped and started fresh on the
+    next startup instead of being reused with their old configuration. Workers owned by a live
+    Compose process can still be adopted.
+  - Shutdown signals received within 200 ms of the first count as one request. A wrapper such as
+    `dotenv --` forwarding the terminal's `Ctrl+C` no longer skips orderly shutdown. A later
+    second signal still exits immediately, leaving the reaper to stop the remaining workers.
+  - `iii ps` lists the current user's local engines, Compose daemons, and workers, with ports,
+    project ownership, uptime, and `orphan` or `no engine` status. Use `iii ps --json` for JSON.
+    `compose::ps` provides the daemon's view, optionally filtered by project, including processes
+    started by its workers.
+  - `iii kill --port <PORT>`, `iii kill --compose [PATH]`, and `iii kill --orphans` stop processes
+    by engine port, project, or orphan status. Compose daemons receive `SIGTERM` first so they
+    can stop their projects in reverse dependency order. Remaining processes receive `SIGTERM`,
+    then `SIGKILL` after 15 seconds; `--force` sends `SIGKILL` immediately.
+  - Engines and the Node, Python, Rust, and Go SDKs write process markers under `~/.iii/run` so
+    `iii ps` can also find workers started outside Compose. Compose workers are identified by
+    their environment, including workers built with older SDKs. Stale markers are removed when
+    listing processes; an unwritable marker directory does not prevent a worker from starting.
+
+  See [Worker Compose](/using-iii/compose#finding-and-stopping-iii-processes) and the
+  [CLI reference](/cli-reference/index).
+
+  ## Lower latency between the engine and Rust workers
+
+  - The engine enables `TCP_NODELAY` on accepted worker connections and advertises
+    `x-iii-capabilities: tcp-nodelay` on the worker listener, including WebSocket upgrades,
+    telemetry, and channel endpoints.
+  - The Rust SDK enables `TCP_NODELAY` on its worker and channel sockets only when the engine
+    advertises support. This removes delayed-ACK stalls on small messages while preserving the
+    existing behavior against older engines. Upgrading both the engine and Rust workers enables
+    both sides of the change; no particular upgrade order is required.
+  - In a Linux loopback benchmark with the engine and workers both updated, p95 latency fell
+    76–96% across the tested agentmemory routes. These are measured examples, not a guarantee
+    for every workload; bulk channel throughput was not benchmarked.
+
+  See [Engine protocol](/reference/engine-protocol) for capability negotiation and
+  [the benchmark results](https://github.com/iii-hq/iii/pull/2325) for the version comparisons.
+
+  ## SDK authentication without tokens in URLs
+
+  - The Node, Python, Rust, and Go SDKs send a nonblank `III_TOKEN` as an
+    `Authorization: Bearer <token>` header during the WebSocket handshake. An explicit
+    `Authorization` header takes precedence, regardless of its capitalization. Workers can
+    authenticate to an RBAC listener without adding the token to the engine URL.
+  - Channels created or resolved by the SDK send the client's handshake headers too. Channel
+    URLs preserve existing query parameters when adding the channel path, access key, and
+    direction, fixing connections that previously lost URL-based authentication.
+  - The Node, Python, and Rust SDKs also pass handshake headers to their telemetry connection.
+    Telemetry helpers accept explicit headers, and Python telemetry defaults to the worker's
+    engine address instead of a separate default address.
+  - Go adds `WithHeaders(http.Header)` for the main connection and channels created by the
+    client. Rust now returns a connection error instead of panicking when an invalid engine
+    address is used with custom headers.
+  - The browser SDK is unchanged because browsers cannot set WebSocket handshake headers.
+    Manually constructed Rust and Go channel endpoints use `III_TOKEN` but do not inherit a
+    client's explicit headers.
+
+  <Callout type="note">
+    Rust's `OtelConfig` adds `engine_ws_headers`. Code that constructs the struct by listing
+    every field must add it or use `..Default::default()`.
+  </Callout>
+
+  ## Trace sampling and archive limits
+
+  - Worker spans received over OTLP are sampled per trace before local storage and collector
+    export. Local roots now honor sampling ratios, operation rules, and rate limits instead of
+    bypassing them because the SDK marked its spans sampled. Parent-based sampling still honors
+    an explicitly remote parent's sampled decision.
+  - With operation rules, child spans arriving before their root can wait up to 2 seconds in a
+    bounded buffer so the root's operation determines the sampling decision. Sampling decisions
+    are retained across live and completed span snapshots and reset when the policy changes.
+  - SQLite archive capacity checks account for page and index costs. Existing archives gain
+    per-trace size accounting automatically. A span that can never fit is counted in
+    `known_dropped_spans`, and its trace reports `completeness: partial`; later smaller spans
+    can still be stored without deleting that trace's existing durable rows.
+  - Archive writes use bounded batches, retry backoff, and rate-limited warnings so a trace that
+    cannot currently fit, or encounters a storage error, does not stop unrelated writes. Flush
+    reports an error when spans remain unwritten rather than reporting success.
+  - Retention returns freed SQLite pages in checkpointed batches instead of creating a WAL as
+    large as the space being reclaimed. Archive and sampling configuration defaults are unchanged.
+  - Clearing metrics now updates both indexes and the total count atomically with respect to
+    concurrent writes, queries, and retention.
+
+  <Callout type="note">
+    The archive's committed SQLite image is bounded by the configured cap plus a tolerance of
+    the larger of 1% or 8 MiB. Temporary WAL and VACUUM space, readers holding snapshots, and
+    slow storage can still cause transient disk growth or control-call timeouts; this is not a
+    strict cap on every filesystem byte at every instant.
+  </Callout>
+
+  ## Lower memory use for queued HTTP bodies
+
+  - Queued binary channel messages retain only their payload instead of the WebSocket's entire
+    read buffer, typically 128 KiB. Small unread HTTP POST bodies no longer keep that buffer
+    alive until the channel expires.
+  - In six-minute tests at 20 requests per second with 100-byte POST bodies, engine RSS growth
+    fell from about 130 KiB per request to about 2 KiB. Channel lifetime, streaming behavior,
+    and delivery to readers that connect after the writer disconnects are unchanged. Unread
+    channels still expire normally; this fixes buffer amplification, not channel lifetime.
+
+  ## Python schema inference
+
+  - Bare `dict` and `list` annotations now produce object and array schemas for function inputs
+    and outputs. Nullable forms, including `Optional[dict]` and `list | None`, are supported.
+    Parameterized containers keep their existing behavior.
+
+  ## Other updates
+
+  - The engine's ZIP dependency moves from the yanked 2.x release line to 9.x, with deflate
+    decoding for Windows release archives. Invalid archive entry names return an extraction error.
+
+  [Compare 0.24.5 to 0.24.6](https://github.com/iii-hq/iii/compare/iii%2Fv0.24.5...iii%2Fv0.24.6).
+</Update>
+
+<Update label="0.24.5" description="October 2026">
+  ## Namespace routing in the SDKs
+
+  - Calls to `configuration::*` without an explicit namespace now resolve in `default`, like
+    `engine::*`, in the Node, browser, Python, Rust, and Go SDKs. Previously a worker running in
+    another namespace failed with `function_not_found` unless it named `default` itself.
+  - The Go SDK now uses the worker's namespace (`III_NAMESPACE` or `WithNamespace`) for other
+    calls and trigger registrations without an explicit namespace, matching the other SDKs.
+    Previously Go sent them without a namespace, so the engine resolved them in `default`. An
+    explicit namespace still takes precedence.
+
+  <Callout type="warning">
+    A Go worker running outside `default` that relied on calls without a namespace reaching
+    functions in `default` must now name `default` explicitly. Calls to `engine::*` and
+    `configuration::*` are not affected.
+  </Callout>
+
+  See [Namespaces](/using-iii/namespaces) for the resolution rules.
+
+  ## Namespaces outside the session scope are rejected
+
+  - When the auth function limits a session to some namespaces and the worker declares another
+    one, the engine now sends `RegistrationRejected` with the code `NAMESPACE_FORBIDDEN` and
+    closes the connection, as it does for `WORKER_NAMESPACE_CONFLICT`. Previously the SDKs did
+    not wait for the `FORBIDDEN` result, so the error was lost and the worker's functions became
+    available in `default` after the connection grace period.
+  - The Node, Python, Rust, and Go SDKs treat the rejection as fatal and stop reconnecting. A
+    caller that waits for `engine::workers::register` still receives `FORBIDDEN`.
+
+  <Callout type="warning">
+    A worker that declares a namespace its session does not allow no longer runs from `default`.
+    Check the namespaces your auth function returns before upgrading.
+  </Callout>
+
+  ## Message size limits in the SDKs
+
+  - The Rust, Node, Python, and Go SDKs reject outgoing JSON messages larger than 16 MiB and
+    incoming messages larger than 64 MiB. Engine limits are unchanged.
+  - A rejected message returns a `payload_too_large` error to the matching call without closing
+    the connection or blocking later messages. When possible, an oversized function result is
+    returned to the caller as an error response.
+
+  ## Compose
+
+  - Updates show the progress of each worker in the Compose panel, including unchanged,
+    in-progress, completed, and failed workers. The panel and `compose::status` report the
+    running version of each worker (`local` for `path://` workers) and the `iii` version of a
+    managed engine.
+  - Empty values in an `env_file` (`KEY=`, `KEY=""`, or `KEY=''`) are ignored instead of
+    overwriting an inherited value or an earlier nonempty value. Whitespace-only values are kept,
+    and nonempty values set in `environment:` still take precedence. Compose shows a warning for
+    each ignored entry, grouped by worker and file, without the value.
+  - On Windows, environment variable names are matched case-insensitively, including across
+    env files.
+  - Compose no longer passes a stored `null` configuration to a worker. On a new Harness project,
+    the second `iii compose --up` stopped the `ide` with `SCHEMA_INVALID`
+    (`null is not of type "object"`), and `harness` with it. The stored entry and the worker's
+    own default now apply instead. A `null` already loaded by an earlier version in a running
+    engine stays until the configuration is saved or the engine restarts.
+
+  See [Worker Compose](/using-iii/compose) for details.
+
+  ## Installer and project setup
+
+  - `install.sh` asks you to press Enter to set up your first project, which runs
+    `iii project init --learn-iii`; Ctrl+C stops with iii installed. It no longer shows this
+    prompt when iii is already installed, so upgrades skip it. When setup cannot run
+    interactively, the installer prints the setup command instead.
+  - `iii project init --learn-iii` no longer asks for provider API keys or other environment
+    variables; the ADE asks for them during setup. It also stops writing `config/console.yaml`
+    and the `config_name` of the `ade` container.
+
+  <Callout type="warning">
+    `--start-with` and `--need-envs` were removed from `install.sh` and
+    `iii project init --learn-iii`. Scripts that pass them now fail with an unknown-argument
+    error.
+  </Callout>
+
+  See [Install](/install).
+
+  ## Sandbox and image isolation
+
+  - Sandboxes no longer boot on the shared image cache. Each sandbox boots on its own read-only
+    root with the cached image as a read-only lower layer, and writes stay in memory inside the
+    VM until it stops. Previously code in a sandbox could modify the cached image, and the
+    change reached every later sandbox created from the same image.
+  - The first `sandbox::create` of an image builds its read-only layer. This took 251 ms for a
+    124 MB image and 455 ms for a 223 MB image in measurements; later creates reuse it.
+  - Builds without the embedded init, such as a plain `cargo build`, refuse `sandbox::create`
+    with `S300`. Official release builds include it.
+  - Images from the RHEL family, such as UBI 9, can now be extracted without root.
+  - When preparing an image, iii no longer follows symlinks from the image on the host. This
+    covers the image configuration, whiteout deletions, `/etc/hosts`, and `init.krun`.
+    Previously pulling an image, for example with `iii worker add <image>` or through a
+    worker's `runtime.base_image`, could overwrite or delete host files outside its root
+    filesystem. An image whose `/etc/hosts` is a symlink now gets the default file, and one
+    whose `/etc` is a symlink gets none.
+
+  <Callout type="warning">
+    Sandbox images cached before this release may have been modified by a sandbox. Remove them
+    with `rm -rf ~/.iii/cache/<slug>*` so they are pulled again.
+  </Callout>
+
+  See [Sandboxes](/creating-workers/sandboxes).
+
+  ## Go SDK trigger type schemas
+
+  - `RegisterTriggerType` accepts an optional `RegisterTriggerTypeOptions` argument with
+    configuration and callback payload schemas. `engine::triggers::info` returns them as
+    `configuration_schema` and `request_schema`.
+  - The SDK rejects a schema that is not valid JSON without replacing an existing registration.
+    It does not validate configurations or payloads against the schemas; handlers still do.
+  - Existing three-argument calls keep working. Interfaces or function variables that require
+    the previous exact method signature must add the new variadic argument.
+
+  ## Engine fixes
+
+  - Fixed a deadlock between stream trigger dispatch and trigger removal, including the removal
+    that runs when a worker disconnects. Writes to every stream could stop, including streams
+    unrelated to the trigger, while `stream::get` kept working.
+  - Fixed a deadlock between metric writes, metric queries by name, and metric retention.
+  - Fixed a race in which a worker that answered or disconnected quickly could do so before the
+    engine recorded the pending call, leaving the caller without a response.
+  - `engine::functions-available` fires when functions are registered or removed, instead of
+    checking every 5 seconds. Changes within 100 ms are sent as one event with the full list.
+    Registering an existing function ID again now also fires it.
+
+  ## Lower memory and CPU use
+
+  Several changes reduce memory use and allocations in the engine and the Rust SDK. The numbers
+  below are measured examples, not a guarantee for every workload.
+
+  - Truncated span attributes no longer keep the memory of the original value. On a
+    long-running Harness workload, heap use with the span cache full dropped from about
+    1.5–1.7 GB to about 455 MiB, and peak RSS from about 1.8–2.0 GB to 950 MiB.
+  - The built-in KV store makes fewer copies on reads, writes, and persistence. With 64 MiB of
+    data, the extra memory for listing every entry dropped from 133 MiB to 67 MiB, and for
+    file-backed writes from 324 MiB to 129 MiB.
+  - On Linux with glibc, the engine returns freed memory to the OS every 60 seconds whether or
+    not the observability worker is enabled.
+  - Trace queries no longer copy span data they do not return. A query over traces with many
+    child spans dropped from about 221 MiB to about 2.4 MiB of allocations; queries over mostly
+    root spans were about 7% slower.
+  - The engine makes fewer copies when invoking functions and handling triggers and streams. In
+    benchmarks with small messages, engine CPU time per call fell 37–80%, while memory rose
+    about 3 MiB.
+  - The Rust SDK serializes each outgoing message once, no longer copies function definitions on
+    each call, and applies the trace payload limit while capturing. A 64 KiB invocation
+    allocated about half as much memory and used 19–26% less CPU.
+
+  [Compare 0.24.4 to 0.24.5](https://github.com/iii-hq/iii/compare/iii%2Fv0.24.4...iii%2Fv0.24.5).
+</Update>
+
 <Update label="0.24.4" description="October 2026">
   ## Faster trace queries
 
